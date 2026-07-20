@@ -1,0 +1,2679 @@
+<!-- File: fort_gbm_v2_mathematical_specification.html -->
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>F-GBM 2.0</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --heading: #102a43;
+      --border: #bcccdc;
+      --panel: #f5f8fb;
+      --note: #edf7f2;
+      --warning: #fff4e5;
+      --error: #fff0f0;
+      --accent: #285f9e;
+      --success: #237a57;
+      --danger: #b23b3b;
+    }
+
+    body {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 32px;
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.75;
+    }
+
+    h1,
+    h2,
+    h3,
+    h4 {
+      color: var(--heading);
+      line-height: 1.35;
+    }
+
+    h2 {
+      margin-top: 48px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid var(--border);
+    }
+
+    h3 {
+      margin-top: 32px;
+    }
+
+    table {
+      width: 100%;
+      margin: 18px 0;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    th {
+      background: #eaf0f6;
+      text-align: left;
+    }
+
+    code {
+      font-family: "SFMono-Regular", Consolas, monospace;
+    }
+
+    .equation {
+      margin: 16px 0;
+      padding: 14px 18px;
+      overflow-x: auto;
+      background: var(--panel);
+      border-left: 4px solid var(--accent);
+    }
+
+    .definition {
+      margin: 16px 0;
+      padding: 14px 18px;
+      background: var(--note);
+      border-left: 4px solid var(--success);
+    }
+
+    .warning {
+      margin: 16px 0;
+      padding: 14px 18px;
+      background: var(--warning);
+      border-left: 4px solid #d98e1f;
+    }
+
+    .correction {
+      margin: 16px 0;
+      padding: 14px 18px;
+      background: var(--error);
+      border-left: 4px solid var(--danger);
+    }
+
+    .small {
+      font-size: 0.92rem;
+      color: #52616f;
+    }
+  </style>
+</head>
+<body>
+  <article>
+    <header>
+      <h1>F-GBM 2.0</h1>
+      <p>
+        Financial Ordered Robust Student-t Gradient Boosting Machine
+      </p>
+      <p>
+        LightGBM型ヒストグラム木、CatBoost型ordered boosting、
+        Student-tロバスト尤度、era-level distributionally robust optimization、
+        因子中立化、turnover正則化を統合した金融特化型GBDTの数学仕様である。
+      </p>
+
+      <div class="warning">
+        本設計は、あらゆる金融分布に対する普遍的な「過学習の完全排除」を保証するものではない。
+        分布外予測に対する無条件の保証はNo-Free-Lunch原理上不可能である。
+        本設計が与えるのは、過学習経路を明示的に制約し、目的関数の単調減少を検証でき、
+        既知のリーク・外れ値・regime集中・因子露出・turnoverに対する耐性を体系化した学習方式である。
+      </div>
+    </header>
+
+    <section>
+      <h2>1. 旧版に対する数学的監査</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>対象</th>
+            <th>旧版の問題</th>
+            <th>判定</th>
+            <th>2.0での修正</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Student-t Hessian</td>
+            <td>
+              厳密Hessianが負になることは認識されていたが、
+              MM曲率が単なる近似なのか、上界構成なのかが明確でなかった。
+            </td>
+            <td>要厳密化</td>
+            <td>
+              \(\log(1+u)\) の接線上界から、固定scale下で正当なquadratic majorizerを導出する。
+            </td>
+          </tr>
+          <tr>
+            <td>KL-DRO</td>
+            <td>
+              制約付きKL-DROと固定temperatureのentropic riskが混在していた。
+            </td>
+            <td>不整合</td>
+            <td>
+              制約付きDROでは双対変数を最適化する。
+              固定temperature版は別objectiveとして明確に分離する。
+            </td>
+          </tr>
+          <tr>
+            <td>era外れ値</td>
+            <td>
+              KL制約だけでは、破損した単一eraに大きな敵対重みが集中し得る。
+            </td>
+            <td>不十分</td>
+            <td>
+              \(q_e\leq\kappa\pi_e\) を加えたcapped KL ambiguity setを採用する。
+            </td>
+          </tr>
+          <tr>
+            <td>因子中立性</td>
+            <td>
+              予測分散で割る比率型ペナルティは非凸かつ、分母が小さい場合に不安定だった。
+            </td>
+            <td>危険</td>
+            <td>
+              固定scaleで正規化したPSD二次形式へ変更する。
+              scaleは学習反復中に微分しない。
+            </td>
+          </tr>
+          <tr>
+            <td>turnover</td>
+            <td>
+              \(\tanh\) と予測依存L1正規化を組み合わせた写像は非凸で、
+              Hessianが不安定かつscale依存だった。
+            </td>
+            <td>危険</td>
+            <td>
+              ex-anteに固定された線形portfolio operatorと凸なsmooth-L1差分へ変更する。
+            </td>
+          </tr>
+          <tr>
+            <td>era stability</td>
+            <td>
+              era損失分散は明確に定義できるが、一般に非凸であり、
+              単純な正曲率近似では目的関数減少が保証されない。
+            </td>
+            <td>要修正</td>
+            <td>
+              固定benchmarkに対するdownside penaltyとCVaRを中心とし、
+              任意の分散項はexact line search付きオプションに降格する。
+            </td>
+          </tr>
+          <tr>
+            <td>葉縮小</td>
+            <td>
+              coverage、sign、freshnessを事後的に乗算しており、
+              どの最適化問題の解かが不明だった。
+            </td>
+            <td>数学的根拠不足</td>
+            <td>
+              coverage依存Gaussian priorを木の正則化へ組み込み、
+              葉値を明示的な凸部分問題の解として導出する。
+            </td>
+          </tr>
+          <tr>
+            <td>pairwise Student-t</td>
+            <td>
+              独立なStudent-t誤差の差もStudent-tであるかのように読めた。
+              一般には成立しない。
+            </td>
+            <td>誤解の余地</td>
+            <td>
+              query-era内で共有するGamma混合変数を仮定し、
+              差分がStudent-tになる階層モデルを明示する。
+            </td>
+          </tr>
+          <tr>
+            <td>MAE</td>
+            <td>
+              \(\sqrt{r^2+\varepsilon^2}\) は厳密にはMAEではなくCharbonnier lossである。
+            </td>
+            <td>名称不正確</td>
+            <td>
+              exact MAEとsmooth MAEを分離する。
+            </td>
+          </tr>
+          <tr>
+            <td>NDCG LambdaRank</td>
+            <td>
+              動的な\(\Delta\mathrm{NDCG}\)重みを使うLambdaRankは、
+              一般に固定された単一スカラー目的関数の勾配とは限らない。
+            </td>
+            <td>要明示</td>
+            <td>
+              厳密pairwise likelihoodと、反復ごとに重みを固定するLambda surrogateを分離する。
+            </td>
+          </tr>
+          <tr>
+            <td>ordered boosting</td>
+            <td>
+              \(F^{(&lt;e_i)}\) を書くだけでは、単一モデルでの実現方法が不明確だった。
+            </td>
+            <td>実装定義不足</td>
+            <td>
+              expanding-window cross-fittingによるout-of-time predictionを正式仕様にする。
+            </td>
+          </tr>
+          <tr>
+            <td>非分離正則化</td>
+            <td>
+              対角majorizerだけでは、非凸項を含む全目的関数の減少を保証できなかった。
+            </td>
+            <td>保証不足</td>
+            <td>
+              木は探索方向として構築し、最終的にexact objective上の一次元line searchで受理判定する。
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>2. データ、時系列情報集合、予測可能性</h2>
+
+      <p>観測を次で表す。</p>
+
+      <div class="equation">
+        \[
+        \mathcal D
+        =
+        \left\{
+          (x_i,c_i,z_i,y_i,e_i,a_i,\omega_i,\mathcal I_i)
+        \right\}_{i=1}^{N}.
+        \]
+      </div>
+
+      <ul>
+        <li>\(x_i\)：数値特徴</li>
+        <li>\(c_i\)：カテゴリ特徴</li>
+        <li>\(z_i\in\mathbb R^K\)：既知risk factor</li>
+        <li>\(y_i\)：回帰値、クラス、またはrelevance</li>
+        <li>\(e_i\)：era</li>
+        <li>\(a_i\)：instrument</li>
+        <li>\(\omega_i\geq0\)：サンプル重み</li>
+        <li>\(\mathcal I_i\)：予測時点で利用可能な情報集合</li>
+      </ul>
+
+      <p>特徴量には必ず予測可能性条件を課す。</p>
+
+      <div class="equation">
+        \[
+        (x_i,c_i,z_i)
+        \quad\text{is measurable with respect to}\quad
+        \mathcal I_i.
+        \]
+      </div>
+
+      <p>
+        target horizonを \(h_i\) とすると、学習サンプルの目的変数が確定する時点は
+        \(t_i+h_i\) である。ordered statisticに利用できる過去集合は、
+      </p>
+
+      <div class="equation">
+        \[
+        \mathcal P_i
+        =
+        \left\{
+          j:
+          t_j+h_j+\delta_{\mathrm{embargo}}&lt;t_i
+        \right\}
+      \]
+      </div>
+
+      <p>
+        とする。単に \(e_j&lt;e_i\) だけでは、overlapping targetによるリークを防げない。
+      </p>
+
+      <h3>2.1 era内正規化</h3>
+
+      <div class="equation">
+        \[
+        W_e
+        =
+        \sum_{i:e_i=e}\omega_i,
+        \qquad
+        a_i
+        =
+        \frac{\omega_i}{W_{e_i}},
+        \qquad
+        \sum_{i:e_i=e}a_i=1.
+        \]
+      </div>
+
+      <p>
+        基本損失はera内で正規化し、eraサイズの違いを学習重要度から切り離す。
+      </p>
+    </section>
+
+    <section>
+      <h2>3. 加法木モデル</h2>
+
+      <div class="equation">
+        \[
+        F^{(M)}(x,c)
+        =
+        F^{(0)}(x,c)
+        +
+        \sum_{m=1}^{M}\alpha_m f_m(x,c),
+        \]
+        \[
+        f_m(x,c)
+        =
+        \sum_{j=1}^{J_m}v_{mj}
+        \mathbf 1[(x,c)\in R_{mj}].
+        \]
+      </div>
+
+      <p>
+        \(f_m\) はヒストグラムベースの決定木である。
+        LightGBM型leaf-wise成長を使用できるが、次の制約を必須とする。
+      </p>
+
+      <ul>
+        <li>最大深さ</li>
+        <li>最小総曲率</li>
+        <li>最小era effective coverage</li>
+        <li>カテゴリ統計のstrict-past制約</li>
+        <li>robust split lower-gain制約</li>
+        <li>木追加後のexact objective line search</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>4. Student-t回帰objectiveの厳密化</h2>
+
+      <h3>4.1 階層表現</h3>
+
+      <p>残差を \(r_i=y_i-F_i\) とする。</p>
+
+      <div class="equation">
+        \[
+        r_i\mid\lambda_i
+        \sim
+        \mathcal N
+        \left(
+          0,\frac{\sigma_i^2}{\lambda_i}
+        \right),
+        \qquad
+        \lambda_i
+        \sim
+        \operatorname{Gamma}
+        \left(
+          \frac{\nu}{2},\frac{\nu}{2}
+        \right).
+        \]
+      </div>
+
+      <p>周辺分布は、</p>
+
+      <div class="equation">
+        \[
+        r_i\sim t_\nu(0,\sigma_i)
+        \]
+      </div>
+
+      <p>であり、定数項を含む負の対数尤度は、</p>
+
+      <div class="equation">
+        \[
+        \ell_{\mathrm t}(r_i;\nu,\sigma_i)
+        =
+        \log\sigma_i
+        +
+        \frac12\log(\nu\pi)
+        +
+        \log\Gamma\left(\frac{\nu}{2}\right)
+        -
+        \log\Gamma\left(\frac{\nu+1}{2}\right)
+        +
+        \frac{\nu+1}{2}
+        \log
+        \left(
+          1+\frac{r_i^2}{\nu\sigma_i^2}
+        \right).
+        \]
+      </div>
+
+      <h3>4.2 勾配、厳密Hessian、影響関数</h3>
+
+      <div class="equation">
+        \[
+        g_i^{\mathrm t}
+        =
+        \frac{\partial\ell_{\mathrm t}}{\partial F_i}
+        =
+        -\frac{(\nu+1)r_i}
+        {\nu\sigma_i^2+r_i^2},
+        \]
+        \[
+        h_{i,\mathrm{exact}}^{\mathrm t}
+        =
+        \frac{\partial^2\ell_{\mathrm t}}{\partial F_i^2}
+        =
+        \frac{
+          (\nu+1)(\nu\sigma_i^2-r_i^2)
+        }{
+          (\nu\sigma_i^2+r_i^2)^2
+        }.
+        \]
+      </div>
+
+      <p>影響関数に対応するscoreは、</p>
+
+      <div class="equation">
+        \[
+        \psi(r)
+        =
+        \frac{(\nu+1)r}{\nu\sigma^2+r^2}.
+        \]
+      </div>
+
+      <p>したがって、</p>
+
+      <div class="equation">
+        \[
+        \sup_r|\psi(r)|
+        =
+        \frac{\nu+1}{2\sqrt{\nu}\sigma},
+        \qquad
+        \lim_{|r|\to\infty}\psi(r)=0.
+        \]
+      </div>
+
+      <p>
+        Student-tは有界かつredescendingな影響関数を持つ。
+        一方で、redescending lossは大きな初期残差を過度に無視する危険があるため、
+        Huber warm startまたは自由度continuationを標準仕様とする。
+      </p>
+
+      <h3>4.3 MM majorizerの導出</h3>
+
+      <p>
+        \(\log(1+u)\) は \(u\geq0\) 上で凹関数であるため、
+        現在値 \(u_i^{(m)}\) における接線は大域的上界になる。
+      </p>
+
+      <div class="equation">
+        \[
+        \log(1+u)
+        \leq
+        \log(1+u_0)
+        +
+        \frac{u-u_0}{1+u_0}.
+        \]
+      </div>
+
+      <p>
+        \(u=r^2/(\nu\sigma^2)\) を代入すると、
+        固定された \(\nu,\sigma\) の下で、
+      </p>
+
+      <div class="equation">
+        \[
+        \ell_{\mathrm t}(r)
+        \leq
+        C(r^{(m)})
+        +
+        \frac12
+        w_i^{(m)}r^2,
+        \]
+        \[
+        w_i^{(m)}
+        =
+        \frac{\nu+1}
+        {\nu\sigma_i^2+(r_i^{(m)})^2}.
+        \]
+      </div>
+
+      <p>したがってMM曲率は、</p>
+
+      <div class="equation">
+        \[
+        h_{i,\mathrm{MM}}^{\mathrm t}
+        =
+        w_i^{(m)}
+        &gt;0.
+        \]
+      </div>
+
+      <div class="definition">
+        これは負の厳密Hessianを便宜的に切り上げたものではない。
+        固定scale・固定自由度のStudent-t負対数尤度に対する正当な大域的quadratic majorizerである。
+      </div>
+
+      <p>数値安定化後の曲率は、</p>
+
+      <div class="equation">
+        \[
+        \bar h_i
+        =
+        \min
+        \left[
+          h_{\max},
+          \max(h_{\min},h_{i,\mathrm{MM}}^{\mathrm t})
+        \right].
+        \]
+      </div>
+
+      <h3>4.4 scaleと自由度の識別</h3>
+
+      <p>制約付きパラメータ化を用いる。</p>
+
+      <div class="equation">
+        \[
+        \sigma_e
+        =
+        \sigma_{\min}
+        +
+        \operatorname{softplus}(s_e),
+        \]
+        \[
+        \nu
+        =
+        \nu_{\min}
+        +
+        (\nu_{\max}-\nu_{\min})
+        \operatorname{sigmoid}(\theta_\nu).
+        \]
+      </div>
+
+      <p>
+        金融リターンの有限分散をモデル上要求する場合は
+        \(\nu_{\min}&gt;2\) とする。
+        redescending robustnessを優先し、有限分散を必須としない場合は
+        \(\nu_{\min}&gt;0\) でも定義可能である。
+      </p>
+
+      <p>era scaleには階層正則化を加える。</p>
+
+      <div class="equation">
+        \[
+        \mathcal R_\sigma
+        =
+        \frac{\lambda_\sigma}{2}
+        \sum_e
+        \left(
+          \log\sigma_e-\log\sigma_0
+        \right)^2
+        +
+        \frac{\lambda_{\sigma,t}}{2}
+        \sum_{e=2}^{E}
+        \left(
+          \log\sigma_e-\log\sigma_{e-1}
+        \right)^2.
+        \]
+      </div>
+
+      <p>
+        木更新中は \(\sigma_e,\nu\) を固定し、
+        木を更新した後にscale・自由度を更新するblock coordinate方式を採用する。
+        \(\sigma_{\min}&gt;0\) によりscale collapseを防止する。
+      </p>
+    </section>
+
+    <section>
+      <h2>5. Capped KL Era-DRO</h2>
+
+      <h3>5.1 era損失</h3>
+
+      <div class="equation">
+        \[
+        L_e(F)
+        =
+        \sum_{i:e_i=e}
+        a_i\ell_i(F_i).
+        \]
+      </div>
+
+      <p>
+        基準era分布を \(\pi_e&gt;0\)、\(\sum_e\pi_e=1\) とする。
+        通常は均等重み、または時間減衰を正規化した重みを用いる。
+      </p>
+
+      <h3>5.2 ambiguity set</h3>
+
+      <div class="equation">
+        \[
+        \mathcal Q_{\rho,\kappa}
+        =
+        \left\{
+          q\in\mathbb R_+^E:
+          \sum_eq_e=1,\;
+          D_{\mathrm{KL}}(q\Vert\pi)\leq\rho,\;
+          q_e\leq\kappa\pi_e
+        \right\}.
+      \]
+      </div>
+
+      <p>ロバストriskは、</p>
+
+      <div class="equation">
+        \[
+        \boxed{
+        \mathcal R_{\mathrm{DRO}}(F)
+        =
+        \max_{q\in\mathcal Q_{\rho,\kappa}}
+        \sum_eq_eL_e(F)
+        }
+      \]
+      </div>
+
+      <p>
+        である。\(\kappa=\infty\) なら通常のKL-DROに戻る。
+        capは破損eraへの敵対重み集中を抑制する。
+      </p>
+
+      <h3>5.3 capなしの場合の双対</h3>
+
+      <div class="equation">
+        \[
+        \mathcal R_{\mathrm{KL}}(F)
+        =
+        \inf_{\tau&gt;0}
+        \left\{
+          \tau\rho
+          +
+          \tau
+          \log
+          \left[
+            \sum_e
+            \pi_e
+            \exp(L_e(F)/\tau)
+          \right]
+        \right\}.
+      \]
+      </div>
+
+      <p>
+        制約付きKL-DROでは \(\tau\) を最適化しなければならない。
+        固定した \(\tau\) を使う場合は、次の別objectiveである。
+      </p>
+
+      <div class="equation">
+        \[
+        \mathcal R_{\mathrm{entropic},\tau}(F)
+        =
+        \tau
+        \log
+        \left[
+          \sum_e\pi_e\exp(L_e(F)/\tau)
+        \right].
+      </div>
+
+      <h3>5.4 DRO勾配</h3>
+
+      <p>
+        最適解 \(q^\star\) が一意なら、envelope theoremにより、
+      </p>
+
+      <div class="equation">
+        \[
+        \frac{\partial\mathcal R_{\mathrm{DRO}}}{\partial F_i}
+        =
+        q_{e_i}^\star
+        a_i
+        \frac{\partial\ell_i}{\partial F_i}.
+      \]
+      </div>
+
+      <p>
+        一意でない場合も、任意の最適 \(q^\star\) が有効な部分勾配を与える。
+        \(q^\star\) は各木の開始時に凸最適化問題として解く。
+      </p>
+    </section>
+
+    <section>
+      <h2>6. Era安定性の再設計</h2>
+
+      <h3>6.1 固定benchmarkに対するdownside risk</h3>
+
+      <p>
+        era平均との差を二乗すると、平均自体がモデル依存で複雑な非凸結合を生む。
+        代わりに、学習前に固定したbenchmark \(b_e\) に対する悪化だけを罰する。
+      </p>
+
+      <div class="equation">
+        \[
+        d_e(F)
+        =
+        s_d
+        \operatorname{softplus}
+        \left(
+          \frac{L_e(F)-b_e}{s_d}
+        \right),
+      \]
+      \[
+        \mathcal R_{\mathrm{down}}(F)
+        =
+        \sum_e\pi_e d_e(F)^2.
+      \]
+      </div>
+
+      <p>
+        \(b_e\) はzero model、linear baseline、または学習前に固定されたbenchmark lossとする。
+        現在モデルの平均損失を \(b_e\) に使ってはならない。
+      </p>
+
+      <h3>6.2 Era-CVaR</h3>
+
+      <div class="equation">
+        \[
+        \operatorname{CVaR}_\alpha(L)
+        =
+        \min_{\zeta\in\mathbb R}
+        \left[
+          \zeta
+          +
+          \frac{1}{1-\alpha}
+          \sum_e
+          \pi_e
+          (L_e-\zeta)_+
+        \right].
+      \]
+      </div>
+
+      <p>微分可能版では、</p>
+
+      <div class="equation">
+        \[
+        (u)_+
+        \approx
+        s_c\operatorname{softplus}(u/s_c).
+      \]
+      </div>
+
+      <p>
+        KL-DROとCVaRは共にtail-eraを重視するため、
+        両方を強く設定すると二重に保守的になる。
+        標準構成ではcapped KL-DROを主軸とし、
+        downside penaltyは小さな補助項とする。
+      </p>
+
+      <h3>6.3 任意のera分散項</h3>
+
+      <div class="equation">
+        \[
+        \mathcal R_{\mathrm{var}}
+        =
+        \sum_e\pi_e
+        \left(
+          L_e-\sum_k\pi_kL_k
+        \right)^2.
+      \]
+      </div>
+
+      <p>
+        この式自体は数学的に定義されるが、一般には凸でない。
+        使用する場合は、木構築時にGauss-Newton近似を使い、
+        後述するexact objective line searchを必須とする。
+        デフォルトでは無効とする。
+      </p>
+    </section>
+
+    <section>
+      <h2>7. Factor-Neutral PenaltyのPSD化</h2>
+
+      <h3>7.1 加重中心化</h3>
+
+      <p>
+        era \(e\) の予測ベクトルを \(F_e\)、
+        対角重み行列を \(W_e\) とする。
+      </p>
+
+      <div class="equation">
+        \[
+        C_e
+        =
+        I
+        -
+        \mathbf 1
+        \frac{
+          \mathbf 1^\top W_e
+        }{
+          \mathbf 1^\top W_e\mathbf 1
+        }.
+      \]
+      </div>
+
+      <p>因子行列も中心化する。</p>
+
+      <div class="equation">
+        \[
+        \widetilde Z_e=C_eZ_e.
+      \]
+      </div>
+
+      <h3>7.2 因子射影</h3>
+
+      <div class="equation">
+        \[
+        M_e
+        =
+        \widetilde Z_e^\top W_e\widetilde Z_e
+        +
+        \gamma_ZI,
+      \]
+      \[
+        P_e
+        =
+        \widetilde Z_e
+        M_e^{-1}
+        \widetilde Z_e^\top W_e.
+      \]
+      </div>
+
+      <h3>7.3 正定値二次ペナルティ</h3>
+
+      <p>
+        \(s_{F,e}&gt;0\) を学習開始前または各木開始時に固定したscaleとする。
+        当該木の最適化中は微分しない。
+      </p>
+
+      <div class="equation">
+        \[
+        \boxed{
+        \mathcal R_{\mathrm{factor}}(F)
+        =
+        \frac12
+        \sum_e
+        \frac{\pi_e}{s_{F,e}^2}
+        (C_eF_e)^\top
+        W_eP_e
+        (C_eF_e)
+        }
+      \]
+      </div>
+
+      <p>
+        \(P_e\) は \(W_e\)-内積に関する射影であり、
+        各項は非負である。勾配は、
+      </p>
+
+      <div class="equation">
+        \[
+        \nabla_{F_e}\mathcal R_{\mathrm{factor}}
+        =
+        \frac{\pi_e}{s_{F,e}^2}
+        C_e^\top W_eP_eC_eF_e.
+      \]
+      </div>
+
+      <p>Hessianは、</p>
+
+      <div class="equation">
+        \[
+        H_{\mathrm{factor},e}
+        =
+        \frac{\pi_e}{s_{F,e}^2}
+        C_e^\top W_eP_eC_e
+        \succeq0.
+      \]
+      </div>
+
+      <div class="definition">
+        旧版の予測分散で割るratio penaltyを廃止したため、
+        分母消失、scale縮小による不安定化、ratio由来の負曲率を回避できる。
+      </div>
+
+      <h3>7.4 Hard neutralizationとの区別</h3>
+
+      <p>推論時の任意の後処理として、</p>
+
+      <div class="equation">
+        \[
+        F_e^\perp
+        =
+        C_eF_e
+        -
+        \alpha_{\mathrm{neut}}P_eC_eF_e,
+        \qquad
+        0\leq\alpha_{\mathrm{neut}}\leq1
+      \]
+      </div>
+
+      <p>
+        を使用できる。ただし学習時penaltyと推論時hard neutralizationは別操作であり、
+        validationでは両者を分離して評価する。
+      </p>
+    </section>
+
+    <section>
+      <h2>8. Turnover正則化の凸化</h2>
+
+      <h3>8.1 固定portfolio operator</h3>
+
+      <p>
+        era \(e\) のraw predictionからポジションスコアへの写像を、
+      </p>
+
+      <div class="equation">
+        \[
+        p_e=B_eF_e
+      \]
+      </div>
+
+      <p>
+        とする。\(B_e\) は、中心化、ex-ante volatility scaling、
+        factor projection、流動性上限の線形近似を含む固定行列である。
+        \(B_e\) は当該boosting反復中に予測値へ依存させない。
+      </p>
+
+      <h3>8.2 instrument対応行列</h3>
+
+      <p>
+        連続era間で共通instrumentを対応させる行列を
+        \(S_{e,e-1}\) とする。
+      </p>
+
+      <div class="equation">
+        \[
+        d_e
+        =
+        p_e-S_{e,e-1}p_{e-1}.
+      \]
+      </div>
+
+      <h3>8.3 Smooth-L1 turnover</h3>
+
+      <div class="equation">
+        \[
+        \phi_\delta(u)
+        =
+        \sqrt{u^2+\delta^2}-\delta,
+      \]
+      \[
+        \boxed{
+        \mathcal R_{\mathrm{turn}}(F)
+        =
+        \sum_{e=2}^{E}
+        \sum_a
+        c_{a,e}\,
+        \phi_\delta(d_{a,e})
+        }
+      \]
+      </div>
+
+      <p>
+        \(\phi_\delta\) は凸であり、
+      </p>
+
+      <div class="equation">
+        \[
+        \phi_\delta'(u)
+        =
+        \frac{u}{\sqrt{u^2+\delta^2}},
+        \qquad
+        \phi_\delta''(u)
+        =
+        \frac{\delta^2}
+        {(u^2+\delta^2)^{3/2}}
+        \geq0.
+      \]
+      </div>
+
+      <p>
+        したがって、固定された線形 \(B_e\) の下で
+        \(\mathcal R_{\mathrm{turn}}\) は予測ベクトルに関して凸である。
+        \(\tanh\) と予測依存gross normalizationは学習目的から除外し、
+        必要なら推論後のportfolio optimizerで処理する。
+      </p>
+    </section>
+
+    <section>
+      <h2>9. 完全統合objective</h2>
+
+      <div class="equation">
+        \[
+        \boxed{
+        \begin{aligned}
+        \mathcal J(F,\sigma,\nu)
+        ={}&
+        \max_{q\in\mathcal Q_{\rho,\kappa}}
+        \sum_eq_eL_e(F;\sigma,\nu)
+        \\
+        &+
+        \lambda_{\mathrm{down}}
+        \mathcal R_{\mathrm{down}}(F)
+        +
+        \lambda_{\mathrm{factor}}
+        \mathcal R_{\mathrm{factor}}(F)
+        \\
+        &+
+        \lambda_{\mathrm{turn}}
+        \mathcal R_{\mathrm{turn}}(F)
+        +
+        \lambda_\sigma\mathcal R_\sigma(\sigma)
+        \\
+        &+
+        \lambda_{\mathrm{var}}
+        \mathcal R_{\mathrm{var}}(F)
+        +
+        \sum_{m=1}^{M}\Omega(f_m).
+        \end{aligned}
+        }
+      \]
+      </div>
+
+      <p>木の構造正則化は、</p>
+
+      <div class="equation">
+        \[
+        \Omega(f_m)
+        =
+        \gamma_{\mathrm{leaf}}J_m
+        +
+        \gamma_{\mathrm{depth}}D_m^2
+        +
+        \sum_{A\in\operatorname{Leaves}(f_m)}
+        \left[
+          \lambda_1|v_A|
+          +
+          \frac12
+          \lambda_{A,\mathrm{total}}v_A^2
+        \right].
+      \]
+      </div>
+
+      <p>
+        \(\lambda_{A,\mathrm{total}}\) は通常のL2正則化と、
+        後述するera coverage priorを含む。
+      </p>
+    </section>
+
+    <section>
+      <h2>10. 回帰objectiveカタログ</h2>
+
+      <p>すべて \(r=y-F\) とする。</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>名称</th>
+            <th>損失</th>
+            <th>勾配</th>
+            <th>木構築用曲率</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>mse</code></td>
+            <td>\(\ell=\frac12r^2\)</td>
+            <td>\(g=-r\)</td>
+            <td>\(h=1\)</td>
+          </tr>
+          <tr>
+            <td><code>mae</code></td>
+            <td>\(\ell=|r|\)</td>
+            <td>\(g=-\operatorname{sign}(r)\)</td>
+            <td>
+              厳密Hessianはほぼ至る所で0。
+              葉値は加重medianで更新するか、first-order法を使用する。
+            </td>
+          </tr>
+          <tr>
+            <td><code>smooth_mae</code></td>
+            <td>
+              \(\ell=\sqrt{r^2+\varepsilon^2}-\varepsilon\)
+            </td>
+            <td>
+              \(g=-r/\sqrt{r^2+\varepsilon^2}\)
+            </td>
+            <td>
+              \(h=\varepsilon^2/(r^2+\varepsilon^2)^{3/2}\)
+            </td>
+          </tr>
+          <tr>
+            <td><code>huber</code></td>
+            <td>
+              \[
+              \ell=
+              \begin{cases}
+              \frac12r^2,&amp;|r|\leq\delta,\\
+              \delta|r|-\frac12\delta^2,&amp;|r|&gt;\delta
+              \end{cases}
+              \]
+            </td>
+            <td>
+              \[
+              g=
+              \begin{cases}
+              -r,&amp;|r|\leq\delta,\\
+              -\delta\operatorname{sign}(r),&amp;|r|&gt;\delta
+              \end{cases}
+              \]
+            </td>
+            <td>
+              \(h=1\) inlier、\(h=0\) outlier。
+              実装ではfirst-orderまたは正のsurrogate floorを使う。
+            </td>
+          </tr>
+          <tr>
+            <td><code>student_t</code></td>
+            <td>
+              \[
+              \ell=
+              \log\sigma+
+              \frac{\nu+1}{2}
+              \log
+              \left(
+                1+\frac{r^2}{\nu\sigma^2}
+              \right)
+              +C_\nu
+              \]
+            </td>
+            <td>
+              \(g=-(\nu+1)r/(\nu\sigma^2+r^2)\)
+            </td>
+            <td>
+              MM曲率
+              \(h=(\nu+1)/(\nu\sigma^2+r_0^2)\)
+            </td>
+          </tr>
+          <tr>
+            <td><code>cauchy</code> / <code>cauch</code></td>
+            <td>
+              \(\ell=\frac{c^2}{2}\log(1+r^2/c^2)\)
+            </td>
+            <td>
+              \(g=-r/(1+r^2/c^2)\)
+            </td>
+            <td>
+              MM曲率
+              \(h=1/(1+r_0^2/c^2)\)
+            </td>
+          </tr>
+          <tr>
+            <td><code>fair</code></td>
+            <td>
+              \[
+              \ell=
+              c^2
+              \left(
+                \frac{|r|}{c}
+                -
+                \log(1+|r|/c)
+              \right)
+              \]
+            </td>
+            <td>
+              \(g=-cr/(c+|r|)\)
+            </td>
+            <td>
+              \(h=c^2/(c+|r|)^2\)
+            </td>
+          </tr>
+          <tr>
+            <td><code>quantile</code></td>
+            <td>
+              \[
+              \rho_\tau(r)=
+              \begin{cases}
+              \tau r,&amp;r\geq0,\\
+              (\tau-1)r,&amp;r&lt;0
+              \end{cases}
+              \]
+            </td>
+            <td>
+              \(g=\mathbf1[r&lt;0]-\tau\)
+            </td>
+            <td>
+              葉値を加重quantileで解くか、
+              smooth quantileを使用する。
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>10.1 Smooth quantile</h3>
+
+      <div class="equation">
+        \[
+        \ell_{\tau,\varepsilon}(r)
+        =
+        \tau\varepsilon
+        \log(1+\exp(r/\varepsilon))
+        +
+        (1-\tau)\varepsilon
+        \log(1+\exp(-r/\varepsilon)).
+        \]
+      </div>
+
+      <p>
+        \(s=\operatorname{sigmoid}(r/\varepsilon)\) とすると、
+      </p>
+
+      <div class="equation">
+        \[
+        g
+        =
+        1-\tau-s,
+        \qquad
+        h
+        =
+        \frac{s(1-s)}{\varepsilon}.
+      \]
+      </div>
+
+      <h3>10.2 Student-t continuation</h3>
+
+      <p>初期木で外れ値を完全に無視しないため、</p>
+
+      <div class="equation">
+        \[
+        \nu_m
+        =
+        \nu_{\mathrm{final}}
+        +
+        (\nu_{\mathrm{start}}-\nu_{\mathrm{final}})
+        \exp(-m/\tau_\nu),
+        \qquad
+        \nu_{\mathrm{start}}\gg\nu_{\mathrm{final}}
+      \]
+      </div>
+
+      <p>
+        とする。初期はGaussianに近く、学習が進むにつれて裾を厚くする。
+      </p>
+    </section>
+
+    <section>
+      <h2>11. Student-t分類</h2>
+
+      <h3>11.1 Binary Student-t link</h3>
+
+      <div class="equation">
+        \[
+        y_i
+        =
+        \mathbf1[F_i+\epsilon_i&gt;0],
+        \qquad
+        \epsilon_i\sim t_\nu(0,s).
+      \]
+      </div>
+
+      <div class="equation">
+        \[
+        p_i
+        =
+        T_\nu(F_i/s),
+        \qquad
+        \ell_i
+        =
+        -y_i\log p_i
+        -(1-y_i)\log(1-p_i).
+      \]
+      </div>
+
+      <p>
+        \(f_\nu\) を標準Student-t密度とし、
+      </p>
+
+      <div class="equation">
+        \[
+        p_i'
+        =
+        \frac1s f_\nu(F_i/s).
+      \]
+      </div>
+
+      <p>勾配は、</p>
+
+      <div class="equation">
+        \[
+        g_i
+        =
+        \frac{(p_i-y_i)p_i'}
+        {p_i(1-p_i)}.
+      \]
+      </div>
+
+      <p>
+        厳密Hessianは観測ラベルに依存し、尾部で不安定になり得る。
+        木構築にはFisher曲率を使う。
+      </p>
+
+      <div class="equation">
+        \[
+        h_{i,\mathrm F}
+        =
+        \frac{(p_i')^2}
+        {p_i(1-p_i)}
+        +
+        h_{\min}.
+      \]
+      </div>
+
+      <p>
+        数値計算ではStudent-t CDFを直接引いて
+        \(1-p\) を求めず、log-CDFとlog-survival functionを使う。
+      </p>
+
+      <h3>11.2 ラベル汚染モデル</h3>
+
+      <div class="equation">
+        \[
+        \widetilde p_i
+        =
+        (1-\epsilon_+-\epsilon_-)p_i+\epsilon_-,
+      \]
+      \[
+        0\leq\epsilon_+,\epsilon_-,
+        \qquad
+        \epsilon_++\epsilon_-&lt;1.
+      \]
+      </div>
+
+      <p>
+        \(\epsilon_+\) と \(\epsilon_-\) はvalidationまたは階層priorで制約し、
+        無制約に学習して分類signalを吸収させてはならない。
+      </p>
+
+      <h3>11.3 Nominal multiclass</h3>
+
+      <p>
+        nominal classには、順序依存するstick-breakingを標準方式にしない。
+        数学的に対称なmultivariate Student-t random utility modelを定義する。
+      </p>
+
+      <div class="equation">
+        \[
+        U_{ik}
+        =
+        F_{ik}+\epsilon_{ik},
+        \qquad
+        \epsilon_i
+        =
+        \frac{L\xi_i}{\sqrt{\lambda_i}},
+      \]
+      \[
+        \xi_i\sim\mathcal N(0,I),
+        \qquad
+        \lambda_i\sim
+        \operatorname{Gamma}
+        \left(
+          \frac\nu2,\frac\nu2
+        \right),
+      \]
+      \[
+        y_i=\arg\max_kU_{ik}.
+      \]
+      </div>
+
+      <p>クラス確率は、</p>
+
+      <div class="equation">
+        \[
+        p_{ik}
+        =
+        P
+        \left(
+          U_{ik}\geq U_{ij}
+          \;\forall j\neq k
+        \right).
+      \]
+      </div>
+
+      <p>
+        一般に閉形式はないため、準Monte Carloまたは共通乱数付きMonte Carloで近似する。
+        大規模用途では、対称なone-vs-rest Student-t linkを正規化した近似モードを提供するが、
+        これは厳密random utility likelihoodとは区別する。
+      </p>
+    </section>
+
+    <section>
+      <h2>12. Student-tランキング</h2>
+
+      <h3>12.1 共有scale-mixtureによる正当化</h3>
+
+      <p>
+        queryまたはera \(e\) 内で、共通混合変数を仮定する。
+      </p>
+
+      <div class="equation">
+        \[
+        \lambda_e
+        \sim
+        \operatorname{Gamma}
+        \left(
+          \frac\nu2,\frac\nu2
+        \right),
+      \]
+      \[
+        \epsilon_i\mid\lambda_e
+        \sim
+        \mathcal N
+        \left(
+          0,\frac{\sigma_e^2}{\lambda_e}
+        \right).
+      \]
+      </div>
+
+      <p>
+        \(i,j\) が同一query-eraに属するとき、
+      </p>
+
+      <div class="equation">
+        \[
+        \epsilon_j-\epsilon_i
+        \mid\lambda_e
+        \sim
+        \mathcal N
+        \left(
+          0,\frac{2\sigma_e^2}{\lambda_e}
+        \right),
+      \]
+      \[
+        \epsilon_j-\epsilon_i
+        \sim
+        t_\nu(0,\sqrt2\sigma_e).
+      \]
+      </div>
+
+      <div class="definition">
+        独立な周辺Student-t変数の差が一般にStudent-tになるわけではない。
+        共有Gamma混合変数を導入することで、pairwise Student-t linkを数学的に正当化する。
+      </div>
+
+      <h3>12.2 Pairwise likelihood</h3>
+
+      <div class="equation">
+        \[
+        d_{ij}=F_i-F_j,
+        \qquad
+        p_{ij}
+        =
+        T_\nu
+        \left(
+          \frac{d_{ij}}{\sqrt2\sigma_e}
+        \right).
+      \]
+      </div>
+
+      <div class="equation">
+        \[
+        \ell_{ij}
+        =
+        -b_{ij}\log p_{ij}
+        -(1-b_{ij})\log(1-p_{ij}).
+      \]
+      </div>
+
+      <p>
+        \(s_e=\sqrt2\sigma_e\)、
+        \(p_{ij}'=f_\nu(d_{ij}/s_e)/s_e\) とすると、
+      </p>
+
+      <div class="equation">
+        \[
+        g_{ij}^{(d)}
+        =
+        \frac{
+          (p_{ij}-b_{ij})p_{ij}'
+        }{
+          p_{ij}(1-p_{ij})
+        },
+      \]
+      \[
+        h_{ij}^{(d)}
+        =
+        \frac{(p_{ij}')^2}
+        {p_{ij}(1-p_{ij})}
+        +
+        h_{\min}.
+      \]
+      </div>
+
+      <p>サンプルへの集約は、</p>
+
+      <div class="equation">
+        \[
+        g_i\mathrel{+}=w_{ij}g_{ij}^{(d)},
+        \qquad
+        g_j\mathrel{-}=w_{ij}g_{ij}^{(d)},
+      \]
+      \[
+        h_i\mathrel{+}=w_{ij}h_{ij}^{(d)},
+        \qquad
+        h_j\mathrel{+}=w_{ij}h_{ij}^{(d)}.
+      \]
+      </div>
+
+      <h3>12.3 Pair sampling</h3>
+
+      <p>
+        全pairは \(O(n_e^2)\) なので、目的を変えないunbiased samplingを使う。
+        pair抽出確率を \(\pi_{ij}^{\mathrm{pair}}&gt;0\) とすると、
+      </p>
+
+      <div class="equation">
+        \[
+        \widehat L_e^{\mathrm{rank}}
+        =
+        \frac1{M_e}
+        \sum_{(i,j)\in\mathcal S_e}
+        \frac{
+          w_{ij}\ell_{ij}
+        }{
+          \pi_{ij}^{\mathrm{pair}}
+        }
+      \]
+      </div>
+
+      <p>
+        は定数倍を除いて全pair損失の不偏推定量になる。
+      </p>
+
+      <h3>12.4 NDCGモード</h3>
+
+      <p>
+        次の重みを各boosting反復の開始時に固定する。
+      </p>
+
+      <div class="equation">
+        \[
+        w_{ij}^{(m)}
+        =
+        \left|
+          \Delta\mathrm{NDCG}_{ij}
+          (F^{(m-1)})
+        \right|.
+      \]
+      </div>
+
+      <p>
+        これは固定されたpairwise surrogateに対しては正当な最適化になるが、
+        反復間で重みが変わるため、全反復を通じた単一固定objectiveとは限らない。
+        よって、次を区別する。
+      </p>
+
+      <ul>
+        <li><code>student_t_pairwise</code>：固定pair重みを持つ厳密likelihood objective</li>
+        <li><code>student_t_lambdarank</code>：反復ごとにNDCG重みを固定するLambda surrogate</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>13. Ordered Categorical Statistics</h2>
+
+      <h3>13.1 Strict information-set rule</h3>
+
+      <p>
+        sample \(i\) のカテゴリ統計には \(\mathcal P_i\) の観測だけを使う。
+      </p>
+
+      <div class="equation">
+        \[
+        \operatorname{OTS}_{i,c}
+        =
+        \frac{
+          a_c\mu_0
+          +
+          \sum_{j\in\mathcal P_i}
+          K(t_i,t_j)
+          \omega_j
+          \mathbf1[c_j=c_i]
+          \phi(y_j)
+        }{
+          a_c
+          +
+          \sum_{j\in\mathcal P_i}
+          K(t_i,t_j)
+          \omega_j
+          \mathbf1[c_j=c_i]
+        }.
+      \]
+      </div>
+
+      <p>時間kernelは、</p>
+
+      <div class="equation">
+        \[
+        K(t_i,t_j)
+        =
+        \exp[-\lambda_t(t_i-t_j)]
+        \mathbf1[t_j+h_j+\delta_{\mathrm{embargo}}&lt;t_i].
+      \]
+      </div>
+
+      <h3>13.2 Student-t robust category location</h3>
+
+      <p>カテゴリ内locationをIRLSで推定する。</p>
+
+      <div class="equation">
+        \[
+        \lambda_j^{(k)}
+        =
+        \frac{\nu_c+1}
+        {
+          \nu_c+
+          (\phi(y_j)-\mu_c^{(k)})^2/\sigma_c^2
+        },
+      \]
+      \[
+        \mu_c^{(k+1)}
+        =
+        \frac{
+          a_c\mu_0
+          +
+          \sum_{j\in\mathcal P_i}
+          K_{ij}\omega_j
+          \lambda_j^{(k)}
+          \phi(y_j)
+        }{
+          a_c
+          +
+          \sum_{j\in\mathcal P_i}
+          K_{ij}\omega_j
+          \lambda_j^{(k)}
+        }.
+      \]
+      </div>
+
+      <p>
+        \(\mu_c\) を両辺に含むため、旧版の式は一回の代入だけでは定義が完結しなかった。
+        2.0では固定点反復またはEMとして明示する。
+      </p>
+
+      <h3>13.3 Ordered boostingの実現</h3>
+
+      <p>
+        時系列foldを、
+      </p>
+
+      <div class="equation">
+        \[
+        \mathcal T_k
+        =
+        \{i:t_i+h_i+\delta_{\mathrm{embargo}}&lt;A_k\},
+        \]
+      </div>
+
+      <div class="equation">
+        \[
+        \mathcal V_k
+        =
+        \{i:A_k\leq t_i&lt;B_k\}
+      \]
+      </div>
+
+      <p>とし、\(\mathcal T_k\) だけで学習したモデルから、</p>
+
+      <div class="equation">
+        \[
+        \widetilde F_i
+        =
+        F^{(-k)}(x_i,c_i),
+        \qquad
+        i\in\mathcal V_k
+      \]
+      </div>
+
+      <p>
+        を生成する。ordered residualは、
+      </p>
+
+      <div class="equation">
+        \[
+        \widetilde g_i
+        =
+        \left.
+        \frac{\partial\ell(y_i,F)}
+        {\partial F}
+        \right|_{F=\widetilde F_i}
+      \]
+      </div>
+
+      <p>
+        とする。単一のin-sample model predictionからカテゴリ統計や残差を作らない。
+      </p>
+    </section>
+
+    <section>
+      <h2>14. 合成勾配とPSD surrogate</h2>
+
+      <h3>14.1 合成勾配</h3>
+
+      <div class="equation">
+        \[
+        G_i
+        =
+        q_{e_i}^\star a_i g_i^{\mathrm{task}}
+        +
+        \lambda_{\mathrm{down}}
+        \frac{\partial\mathcal R_{\mathrm{down}}}{\partial F_i}
+        +
+        \lambda_{\mathrm{factor}}
+        \frac{\partial\mathcal R_{\mathrm{factor}}}{\partial F_i}
+        +
+        \lambda_{\mathrm{turn}}
+        \frac{\partial\mathcal R_{\mathrm{turn}}}{\partial F_i}
+        +
+        \lambda_{\mathrm{var}}
+        \frac{\partial\mathcal R_{\mathrm{var}}}{\partial F_i}.
+      \]
+      </div>
+
+      <h3>14.2 非対角Hessianの対角majorization</h3>
+
+      <p>
+        factor penaltyとturnoverはサンプル間結合を持つ。
+        対称HessianまたはPSD surrogateを \(H\) とし、
+      </p>
+
+      <div class="equation">
+        \[
+        D_{ii}
+        =
+        H_{ii}
+        +
+        \sum_{j\neq i}|H_{ij}|
+        +
+        h_{\min}.
+      \]
+      </div>
+
+      <p>すると、</p>
+
+      <div class="equation">
+        \[
+        D-H\succeq0
+      \]
+      </div>
+
+      <p>
+        である。実際、任意の \(x\) に対して、
+      </p>
+
+      <div class="equation">
+        \[
+        x^\top(D-H)x
+        =
+        \frac12
+        \sum_{i\neq j}
+        |H_{ij}|
+        \left(
+          x_i-\operatorname{sign}(H_{ij})x_j
+        \right)^2
+        +
+        h_{\min}\|x\|_2^2
+        \geq0.
+      \]
+      </div>
+
+      <p>
+        よって \(D\) は \(H\) の対角上界として利用できる。
+        ただし非凸な任意項については大域的majorizerとは限らないため、
+        最終受理にはexact line searchを使用する。
+      </p>
+    </section>
+
+    <section>
+      <h2>15. Era-Robust Split Criterion 2.0</h2>
+
+      <h3>15.1 ノード統計</h3>
+
+      <div class="equation">
+        \[
+        G_{A,e}
+        =
+        \sum_{i\in A:e_i=e}G_i,
+        \qquad
+        H_{A,e}
+        =
+        \sum_{i\in A:e_i=e}H_i.
+      \]
+      </div>
+
+      <div class="equation">
+        \[
+        G_A=\sum_eG_{A,e},
+        \qquad
+        H_A=\sum_eH_{A,e}.
+      \]
+      </div>
+
+      <h3>15.2 coverage-aware leaf prior</h3>
+
+      <p>
+        era supportはサンプル数ではなく曲率質量で測る。
+      </p>
+
+      <div class="equation">
+        \[
+        u_{A,e}
+        =
+        \frac{H_{A,e}}
+        {H_A+\varepsilon},
+        \qquad
+        N_{\mathrm{eff},A}
+        =
+        \frac{1}
+        {\sum_eu_{A,e}^2+\varepsilon}.
+      \]
+      </div>
+
+      <p>
+        親ノードで支持されるera集合を \(\mathcal E_A\) とし、
+        基準分布をその集合上で再正規化する。
+      </p>
+
+      <div class="equation">
+        \[
+        \pi_{A,e}
+        =
+        \frac{
+          \pi_e\mathbf1[e\in\mathcal E_A]
+        }{
+          \sum_{k\in\mathcal E_A}\pi_k
+        }.
+      \]
+      </div>
+
+      <p>支持集中度を、</p>
+
+      <div class="equation">
+        \[
+        \chi_A^2
+        =
+        \sum_{e\in\mathcal E_A}
+        \frac{
+          (u_{A,e}-\pi_{A,e})^2
+        }{
+          \pi_{A,e}+\varepsilon
+        }.
+      \]
+      </div>
+
+      <p>鮮度不足を、</p>
+
+      <div class="equation">
+        \[
+        d_A^{\mathrm{stale}}
+        =
+        1-
+        \sum_e
+        u_{A,e}
+        \exp[-\lambda_d(t_{\max}-t_e)]
+      \]
+      </div>
+
+      <p>とし、coverage prior precisionを、</p>
+
+      <div class="equation">
+        \[
+        \lambda_{A,\mathrm{cov}}
+        =
+        H_{\mathrm{ref}}
+        \left[
+          \frac{\kappa_E}
+          {N_{\mathrm{eff},A}+\varepsilon}
+          +
+          \kappa_\chi\chi_A^2
+          +
+          \kappa_d d_A^{\mathrm{stale}}
+        \right].
+      \]
+      </div>
+
+      <p>総L2 precisionは、</p>
+
+      <div class="equation">
+        \[
+        \lambda_{A,\mathrm{total}}
+        =
+        \lambda_2+\lambda_{A,\mathrm{cov}}.
+      \]
+      </div>
+
+      <h3>15.3 葉値</h3>
+
+      <p>葉部分問題を、</p>
+
+      <div class="equation">
+        \[
+        Q_A(v)
+        =
+        G_Av
+        +
+        \frac12
+        (H_A+\lambda_{A,\mathrm{total}})v^2
+        +
+        \lambda_1|v|
+      \]
+      </div>
+
+      <p>とすると、最適葉値は、</p>
+
+      <div class="equation">
+        \[
+        \boxed{
+        v_A^\star
+        =
+        -
+        \frac{
+          \operatorname{SoftThreshold}(G_A,\lambda_1)
+        }{
+          H_A+\lambda_{A,\mathrm{total}}
+        }
+        }
+      \]
+      </div>
+
+      <div class="definition">
+        coverage shrinkageは事後的な経験則ではなく、
+        era coverageに依存するzero-mean Gaussian priorを含む凸葉最適化問題の解になる。
+      </div>
+
+      <h3>15.4 era別surrogate改善量</h3>
+
+      <p>
+        親 \(P\) を子 \(L,R\) に分割したとき、
+      </p>
+
+      <div class="equation">
+        \[
+        \Delta_e
+        =
+        \left(
+          G_{P,e}v_P+\frac12H_{P,e}v_P^2
+        \right)
+        -
+        \left(
+          G_{L,e}v_L+\frac12H_{L,e}v_L^2
+        \right)
+        -
+        \left(
+          G_{R,e}v_R+\frac12H_{R,e}v_R^2
+        \right).
+      \]
+      </div>
+
+      <p>
+        構造正則化とleaf priorの変化は、eraへ恣意的に配分せず、
+        最後に全体から差し引く。
+      </p>
+
+      <h3>15.5 Robust lower gain</h3>
+
+      <div class="equation">
+        \[
+        \mathcal G_{\mathrm{rob}}
+        =
+        \min_{
+          q\in\mathcal Q_{A,\rho_s,\kappa_s}
+        }
+        \sum_{e\in\mathcal E_P}q_e\Delta_e.
+      \]
+      </div>
+
+      <p>
+        capなしの場合の双対は、
+      </p>
+
+      <div class="equation">
+        \[
+        \mathcal G_{\mathrm{rob}}
+        =
+        \sup_{\tau_s&gt;0}
+        \left[
+          -\tau_s\rho_s
+          -
+          \tau_s
+          \log
+          \left(
+            \sum_{e\in\mathcal E_P}
+            \pi_{P,e}
+            \exp(-\Delta_e/\tau_s)
+          \right)
+        \right].
+      \]
+      </div>
+
+      <p>
+        固定temperatureを使う場合は近似soft-minであり、
+        制約付きDROの厳密値ではない。
+      </p>
+
+      <h3>15.6 最終split score</h3>
+
+      <div class="equation">
+        \[
+        \boxed{
+        \begin{aligned}
+        \operatorname{Score}(P\to L,R)
+        ={}&
+        \mathcal G_{\mathrm{rob}}
+        -
+        \Delta\Omega_{\mathrm{leaf}}
+        -
+        \gamma_{\mathrm{leaf}}
+        \\
+        &-
+        \kappa_{\mathrm{neg}}
+        \sum_e
+        \pi_{P,e}
+        (-\Delta_e)_+
+        \\
+        &-
+        \kappa_{\mathrm{disp}}
+        \operatorname{MAD}_{\pi_P}(\Delta_e).
+        \end{aligned}
+        }
+      \]
+      </div>
+
+      <p>
+        \(\operatorname{MAD}_{\pi_P}\) はweighted median absolute deviationであり、
+        分散よりも極端なera利得へ頑健である。
+      </p>
+
+      <h3>15.7 採用条件</h3>
+
+      <ul>
+        <li>\(\operatorname{Score}&gt;0\)</li>
+        <li>\(N_{\mathrm{eff},L},N_{\mathrm{eff},R}\geq N_{\mathrm{era,min}}\)</li>
+        <li>\(H_L,H_R\geq H_{\min}\)</li>
+        <li>各子の最近era coverageが下限以上</li>
+        <li>カテゴリ分割がstrict-past統計だけを使用</li>
+        <li>monotonic constraintまたはinteraction constraintに違反しない</li>
+      </ul>
+
+      <h3>15.8 Robust improvement lower bound</h3>
+
+      <p>
+        各eraで \(\Delta_e\) が真の損失改善量の下界であると仮定する。
+        これは固定scale Student-t MM surrogateでは構成可能である。
+        すると、
+      </p>
+
+      <div class="equation">
+        \[
+        \mathcal R_{\mathrm{DRO}}(F)
+        -
+        \mathcal R_{\mathrm{DRO}}(F+f)
+        \geq
+        \min_{q\in\mathcal Q}
+        \sum_eq_e\Delta_e.
+      \]
+      </div>
+
+      <p>
+        よって \(\mathcal G_{\mathrm{rob}}&gt;0\) は、
+        separableなDRO task loss部分に対する保守的改善条件になる。
+        非分離正則化を含む完全objectiveについては、次節のline searchで検証する。
+      </p>
+    </section>
+
+    <section>
+      <h2>16. Exact Objective Line Search</h2>
+
+      <p>
+        木 \(f_m\) はPSD surrogateから得た探索方向であり、
+        そのまま固定learning rateで追加しない。
+      </p>
+
+      <div class="equation">
+        \[
+        \alpha_m^\star
+        =
+        \arg\min_{
+          0\leq\alpha\leq\alpha_{\max}
+        }
+        \mathcal J
+        \left(
+          F^{(m-1)}+\alpha f_m
+        \right).
+      \]
+      </div>
+
+      <p>Armijo条件を、</p>
+
+      <div class="equation">
+        \[
+        \mathcal J(F+\alpha f)
+        \leq
+        \mathcal J(F)
+        +
+        c_1\alpha
+        \nabla\mathcal J(F)^\top f,
+        \qquad
+        0&lt;c_1&lt;1
+      \]
+      </div>
+
+      <p>
+        で確認する。条件を満たさない場合は \(\alpha\) を縮小する。
+        最小stepでも満たさない場合、その木を棄却する。
+      </p>
+
+      <div class="definition">
+        この受理機構により、非凸なStudent-t objective、
+        任意のera variance項、近似対角Hessianを併用しても、
+        評価した完全objectiveが増加する木は追加されない。
+      </div>
+
+      <p>
+        DRO内側問題の \(q^\star\) は各line-search候補で再最適化する。
+        古い \(q^\star\) の固定評価だけで受理してはならない。
+      </p>
+    </section>
+
+    <section>
+      <h2>17. Numerai型金融評価との整合</h2>
+
+      <h3>17.1 Era rank correlation</h3>
+
+      <div class="equation">
+        \[
+        U_{i,e}
+        =
+        \frac{
+          \operatorname{rank}_e(F_i)-1/2
+        }{
+          n_e
+        },
+        \qquad
+        \widehat F_{i,e}
+        =
+        \Phi^{-1}(U_{i,e}).
+      \]
+      </div>
+
+      <div class="equation">
+        \[
+        S_e
+        =
+        \operatorname{Corr}_{W_e}
+        (\widehat F_e,y_e).
+      \]
+      </div>
+
+      <p>
+        hard rankは微分不可能であるため、標準構成ではvalidation metricとして使う。
+        学習objectiveへ入れる場合はsoft-rankを使うが、
+        計算量と近似誤差を別途管理する。
+      </p>
+
+      <h3>17.2 Feature-neutral score</h3>
+
+      <div class="equation">
+        \[
+        F_e^{\mathrm{FN}}
+        =
+        (I-\alpha P_{X,e})C_eF_e,
+      \]
+      \[
+        S_e^{\mathrm{FN}}
+        =
+        \operatorname{Corr}_{W_e}
+        (F_e^{\mathrm{FN}},y_e).
+      \]
+      </div>
+
+      <h3>17.3 Meta-model contribution</h3>
+
+      <div class="equation">
+        \[
+        F_e^{\perp M}
+        =
+        C_eF_e
+        -
+        C_eM_e
+        \frac{
+          M_e^\top C_e^\top W_eC_eF_e
+        }{
+          M_e^\top C_e^\top W_eC_eM_e+\varepsilon
+        }.
+      \]
+      </div>
+
+      <div class="equation">
+        \[
+        S_e^{\mathrm{MMC}}
+        =
+        \operatorname{Corr}_{W_e}
+        (F_e^{\perp M},y_e).
+      \]
+      </div>
+
+      <p>
+        meta-model predictionはout-of-timeで生成されていなければならない。
+      </p>
+    </section>
+
+    <section>
+      <h2>18. 時系列validation</h2>
+
+      <h3>18.1 Purged walk-forward</h3>
+
+      <div class="equation">
+        \[
+        \mathcal T_k
+        =
+        \left\{
+          i:
+          t_i+h_i+\delta_{\mathrm{embargo}}&lt;A_k
+        \right\},
+      \]
+      \[
+        \mathcal V_k
+        =
+        \left\{
+          i:
+          A_k\leq t_i&lt;B_k
+        \right\}.
+      \]
+      </div>
+
+      <p>
+        ランダムK-fold、未来eraを含むtarget encoding、
+        validation eraを用いたscale・factor・category推定は禁止する。
+      </p>
+
+      <h3>18.2 Validation utility</h3>
+
+      <div class="equation">
+        \[
+        U_{\mathrm{val}}
+        =
+        \overline S
+        -
+        \kappa_{\mathrm{std}}
+        \operatorname{Std}(S_e)
+        -
+        \kappa_{\mathrm{cvar}}
+        \operatorname{CVaR}_\alpha(-S_e)
+        -
+        \kappa_{\mathrm{mdd}}
+        \operatorname{MDD}(S)
+      \]
+      </div>
+
+      <div class="equation">
+        \[
+        \qquad
+        -
+        \kappa_T\operatorname{Turnover}
+        -
+        \kappa_C\operatorname{Cost}
+        -
+        \kappa_F\operatorname{Exposure}
+        +
+        \kappa_{\mathrm{FN}}
+        \overline S^{\mathrm{FN}}.
+      \]
+      </div>
+
+      <p>
+        early stoppingは、複数walk-forward foldの中央値または下側信頼限界で判定する。
+      </p>
+
+      <h3>18.3 不確実性補正</h3>
+
+      <p>
+        era scoreに自己相関があるため、通常の独立標準誤差を使わない。
+        block bootstrapまたはHAC分散を用いる。
+      </p>
+
+      <div class="equation">
+        \[
+        \operatorname{LCB}_{1-\alpha}
+        =
+        \widehat U
+        -
+        z_{1-\alpha}
+        \widehat{\operatorname{SE}}_{\mathrm{HAC}}(\widehat U).
+      \]
+      </div>
+
+      <p>
+        モデル選択では \(\widehat U\) ではなくLCBを最大化する。
+      </p>
+    </section>
+
+    <section>
+      <h2>19. 完全学習アルゴリズム</h2>
+
+      <ol>
+        <li>
+          target horizon、情報公開時点、embargoを定義し、
+          各サンプルの利用可能情報集合 \(\mathcal I_i\) を確定する。
+        </li>
+        <li>
+          purged expanding-window foldを構成する。
+        </li>
+        <li>
+          strict-pastかつtarget-maturity条件を満たすデータだけで
+          ordered categorical statisticsを生成する。
+        </li>
+        <li>
+          Huber、Gaussian Student-t、または定数モデルで初期予測 \(F^{(0)}\) を作る。
+        </li>
+        <li>
+          学習データだけからfactor operator、portfolio operator、
+          benchmark loss、scale priorを構築する。
+        </li>
+        <li>
+          現在残差から \(\sigma_e,\nu\) を制約付きblock updateする。
+        </li>
+        <li>
+          era損失 \(L_e\) を計算し、capped KL-DRO内側問題から \(q^\star\) を求める。
+        </li>
+        <li>
+          task、downside、factor、turnoverの合成勾配を計算する。
+        </li>
+        <li>
+          Student-t MM曲率、Fisher曲率、PSD penalty Hessianを構成する。
+        </li>
+        <li>
+          非対角Hessianを必要に応じて対角majorizeする。
+        </li>
+        <li>
+          数値特徴とordered category特徴のヒストグラムを構築する。
+        </li>
+        <li>
+          各候補分割についてcoverage-aware leaf priorと葉値を計算する。
+        </li>
+        <li>
+          era別surrogate改善量 \(\Delta_e\) を計算する。
+        </li>
+        <li>
+          capped robust lower gain、negative-era penalty、
+          robust dispersionを含むsplit scoreを評価する。
+        </li>
+        <li>
+          制約を満たす最大scoreのsplitをleaf-wiseに採用する。
+        </li>
+        <li>
+          木完成後、完全objective上でDROを再最適化しながらline searchする。
+        </li>
+        <li>
+          objectiveを減少させない木は棄却する。
+        </li>
+        <li>
+          purged walk-forward validationのLCBが改善しない場合は停止する。
+        </li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>20. 数値安定性の必須条件</h2>
+
+      <ul>
+        <li>
+          Student-t CDF、survival probability、Gamma関数はlog-domainで計算する。
+        </li>
+        <li>
+          \(\log\sum\exp\) は最大値を引くlog-sum-expで計算する。
+        </li>
+        <li>
+          \(p\) は \([\varepsilon_p,1-\varepsilon_p]\) に数値上clipする。
+        </li>
+        <li>
+          scaleには \(\sigma_{\min}&gt;0\) を課す。
+        </li>
+        <li>
+          曲率には \(0&lt;h_{\min}&lt;h_{\max}\) を課す。
+        </li>
+        <li>
+          因子Gram行列に \(\gamma_ZI\) を加える。
+        </li>
+        <li>
+          category countが少ない場合はglobal priorへ縮小する。
+        </li>
+        <li>
+          DRO計算では \(\pi_e&gt;0\) を保証する。
+        </li>
+        <li>
+          すべてのvalidation変換はtrain fit、validation applyで行う。
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>21. 推奨デフォルトモード</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>タスク</th>
+            <th>主objective</th>
+            <th>曲率</th>
+            <th>主要正則化</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>金融回帰</td>
+            <td><code>student_t</code></td>
+            <td>Student-t MM</td>
+            <td>capped era-DRO、factor、turnover、coverage prior</td>
+          </tr>
+          <tr>
+            <td>Binary分類</td>
+            <td><code>student_t_binary</code></td>
+            <td>Fisher</td>
+            <td>capped era-DRO、label-noise prior、factor</td>
+          </tr>
+          <tr>
+            <td>Nominal multiclass</td>
+            <td><code>multivariate_t_utility</code></td>
+            <td>Monte Carlo Fisher近似</td>
+            <td>capped era-DRO、class calibration</td>
+          </tr>
+          <tr>
+            <td>Ranking</td>
+            <td><code>student_t_pairwise</code></td>
+            <td>Pairwise Fisher</td>
+            <td>capped era-DRO、unbiased pair sampling、turnover</td>
+          </tr>
+          <tr>
+            <td>NDCG ranking</td>
+            <td><code>student_t_lambdarank</code></td>
+            <td>反復固定Lambda surrogate</td>
+            <td>exact validation、robust split</td>
+          </tr>
+          <tr>
+            <td>Quantile</td>
+            <td><code>quantile</code>または<code>smooth_quantile</code></td>
+            <td>加重quantileまたはsmooth Hessian</td>
+            <td>crossing penalty、era-DRO</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>22. 過学習耐性の構造</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>過学習経路</th>
+            <th>数学的防御</th>
+            <th>残る限界</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>極端なサンプル</td>
+            <td>Student-t有界・redescending influence</td>
+            <td>初期残差が大きい真のsignalも弱く扱い得る</td>
+          </tr>
+          <tr>
+            <td>極端なera</td>
+            <td>capped KL-DRO</td>
+            <td>未知regimeがambiguity set外なら保証されない</td>
+          </tr>
+          <tr>
+            <td>少数eraだけのsplit</td>
+            <td>robust lower gain、effective coverage</td>
+            <td>真にregime-specificなalphaも抑制し得る</td>
+          </tr>
+          <tr>
+            <td>低coverage葉</td>
+            <td>coverage-dependent prior precision</td>
+            <td>prior強度のvalidationが必要</td>
+          </tr>
+          <tr>
+            <td>target encoding leakage</td>
+            <td>target maturity付きstrict-past OTS</td>
+            <td>元特徴自体のリークは別監査が必要</td>
+          </tr>
+          <tr>
+            <td>既知因子の再発見</td>
+            <td>PSD factor projection penalty</td>
+            <td>未観測因子への露出は残る</td>
+          </tr>
+          <tr>
+            <td>過剰売買</td>
+            <td>凸smooth-L1 temporal regularization</td>
+            <td>非線形market impactは別portfolio最適化が必要</td>
+          </tr>
+          <tr>
+            <td>近似Hessianの誤差</td>
+            <td>exact objective line search</td>
+            <td>局所解への収束は避けられない</td>
+          </tr>
+          <tr>
+            <td>多数回のモデル選択</td>
+            <td>walk-forward LCB、HAC、block bootstrap</td>
+            <td>研究者自由度によるselection biasは記録管理が必要</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>23. 必須検証と反証可能性</h2>
+
+      <h3>23.1 アブレーション</h3>
+
+      <ol>
+        <li>標準LightGBM</li>
+        <li>Student-t objectiveのみ</li>
+        <li>Student-t MMとexact line search</li>
+        <li>ordered statistics追加</li>
+        <li>capped era-DRO追加</li>
+        <li>robust split追加</li>
+        <li>coverage prior追加</li>
+        <li>factor penalty追加</li>
+        <li>turnover penalty追加</li>
+        <li>完全構成</li>
+      </ol>
+
+      <h3>23.2 数学単体テスト</h3>
+
+      <ul>
+        <li>有限差分による全objective勾配検証</li>
+        <li>Student-t MM上界が全試験点で成立すること</li>
+        <li>\(D-H\succeq0\) の固有値検証</li>
+        <li>DRO primal値とdual値の一致</li>
+        <li>cap付きDROのKKT条件検証</li>
+        <li>葉値が葉部分問題の最小値を与えること</li>
+        <li>line search受理後に完全objectiveが非増加であること</li>
+        <li>ordered statisticが未来target変更に不変であること</li>
+        <li>shared-scale ranking simulationが理論的Student-t差分に一致すること</li>
+      </ul>
+
+      <h3>23.3 金融評価</h3>
+
+      <ul>
+        <li>平均era score</li>
+        <li>era score標準偏差</li>
+        <li>worst 5% era score</li>
+        <li>era-CVaR</li>
+        <li>HAC補正Sharpe</li>
+        <li>最大drawdown</li>
+        <li>feature-neutral score</li>
+        <li>meta-model contribution</li>
+        <li>最大factor exposure</li>
+        <li>turnover</li>
+        <li>spread・impact控除後utility</li>
+        <li>seed間性能分散</li>
+        <li>train-validation gap</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>24. 2.0最終仕様</h2>
+
+      <div class="equation">
+        \[
+        \boxed{
+        \begin{aligned}
+        \mathrm{FORT\mbox{-}GBM\ 2.0}
+        ={}&
+        \mathrm{Student\mbox{-}t\ MM\ Boosting}
+        \\
+        &+
+        \mathrm{Target\mbox{-}Maturity\ Ordered\ Learning}
+        \\
+        &+
+        \mathrm{Capped\ Era\ KL\mbox{-}DRO}
+        \\
+        &+
+        \mathrm{Robust\ Lower\mbox{-}Gain\ Splitting}
+        \\
+        &+
+        \mathrm{Coverage\mbox{-}Dependent\ Bayesian\ Leaf\ Prior}
+        \\
+        &+
+        \mathrm{PSD\ Factor\ Neutralization}
+        \\
+        &+
+        \mathrm{Convex\ Temporal\ Turnover\ Regularization}
+        \\
+        &+
+        \mathrm{Exact\ Objective\ Line\ Search}.
+        \end{aligned}
+        }
+      \]
+      </div>
+
+      <p>数学的に重要な改訂点は次の通りである。</p>
+
+      <ol>
+        <li>
+          Student-t曲率を、負Hessianの切り上げではなく、
+          凹関数の接線上界から導かれるMM majorizerとして再定義した。
+        </li>
+        <li>
+          制約付きKL-DROと固定temperature entropic riskを分離した。
+        </li>
+        <li>
+          era汚染への過集中を防ぐため、敵対重みにcapを加えた。
+        </li>
+        <li>
+          factor penaltyを固定scaleのPSD二次形式に変更した。
+        </li>
+        <li>
+          turnoverを固定線形portfolio operator上の凸smooth-L1へ変更した。
+        </li>
+        <li>
+          葉縮小を経験的乗算から、coverage-dependent priorを持つ明示的最適化問題へ変更した。
+        </li>
+        <li>
+          pairwise Student-tを共有Gamma混合変数から厳密に導出した。
+        </li>
+        <li>
+          ordered statisticsにtarget maturityとembargoを導入した。
+        </li>
+        <li>
+          近似木探索の後に完全objectiveを再評価し、
+          line searchで目的関数増加を拒否する構造を導入した。
+        </li>
+        <li>
+          回帰、分類、rankingを共通のera-DRO、ordered learning、
+          robust split、coverage priorの体系で統一した。
+        </li>
+      </ol>
+    </section>
+  </article>
+</body>
+</html>
