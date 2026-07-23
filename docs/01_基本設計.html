@@ -1,0 +1,1882 @@
+<!-- File: fort_gbm_v2_basic_design.html -->
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FORT-GBM v2 基本設計書</title>
+  <style>
+    :root {
+      --ink: #172033;
+      --heading: #102a43;
+      --accent: #285f9e;
+      --border: #bcccdc;
+      --panel: #f5f8fb;
+      --note: #edf7f2;
+      --warning: #fff4e5;
+      --danger: #fff0f0;
+      --success: #237a57;
+    }
+
+    body {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 32px;
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.75;
+    }
+
+    h1,
+    h2,
+    h3,
+    h4 {
+      color: var(--heading);
+      line-height: 1.35;
+    }
+
+    h2 {
+      margin-top: 48px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid var(--border);
+    }
+
+    h3 {
+      margin-top: 30px;
+    }
+
+    table {
+      width: 100%;
+      margin: 18px 0;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    th {
+      background: #eaf0f6;
+      text-align: left;
+    }
+
+    code {
+      font-family: "SFMono-Regular", Consolas, monospace;
+    }
+
+    pre {
+      padding: 16px;
+      overflow-x: auto;
+      background: #172033;
+      color: #f1f5f9;
+      border-radius: 6px;
+      line-height: 1.55;
+    }
+
+    .equation {
+      margin: 16px 0;
+      padding: 14px 18px;
+      overflow-x: auto;
+      background: var(--panel);
+      border-left: 4px solid var(--accent);
+      font-family: "Times New Roman", serif;
+    }
+
+    .definition {
+      margin: 16px 0;
+      padding: 14px 18px;
+      background: var(--note);
+      border-left: 4px solid var(--success);
+    }
+
+    .warning {
+      margin: 16px 0;
+      padding: 14px 18px;
+      background: var(--warning);
+      border-left: 4px solid #d98e1f;
+    }
+
+    .danger {
+      margin: 16px 0;
+      padding: 14px 18px;
+      background: var(--danger);
+      border-left: 4px solid #b23b3b;
+    }
+
+    .small {
+      color: #52616f;
+      font-size: 0.92rem;
+    }
+  </style>
+</head>
+<body>
+  <article>
+    <header>
+      <h1>FORT-GBM v2 基本設計書</h1>
+      <p>
+        Financial Ordered Robust Student-t Gradient Boosting Machine
+      </p>
+      <p>
+        Student-tロバスト学習、時系列ordered encoding、era-level DRO、
+        era-robust split、因子中立化、turnover正則化を統合する
+        金融特化型勾配ブースティングライブラリの基本設計を定義する。
+      </p>
+
+      <div class="warning">
+        本書はライブラリの責務、構成、主要インターフェース、学習フロー、
+        データ構造、制約および受入条件を定める基本設計書である。
+        個々の数値アルゴリズム、メモリ配置、SIMD、GPU kernelなどは詳細設計で確定する。
+      </div>
+    </header>
+
+    <section>
+      <h2>1. 目的と適用範囲</h2>
+
+      <h3>1.1 開発目的</h3>
+
+      <p>
+        FORT-GBM v2は、金融時系列・横断面データに特有の次の問題を、
+        後処理ではなく学習アルゴリズム内部で制御する。
+      </p>
+
+      <ol>
+        <li>極端値、誤ラベル、fat-tail residual</li>
+        <li>特定eraまたは特定regimeへの性能集中</li>
+        <li>カテゴリtarget encodingによる時系列リーク</li>
+        <li>既知risk factorとalphaの混同</li>
+        <li>低era coverageの葉による偶然適合</li>
+        <li>予測変動に起因する過剰turnover</li>
+        <li>平均性能だけを基準とする不安定なモデル選択</li>
+      </ol>
+
+      <h3>1.2 対象タスク</h3>
+
+      <ul>
+        <li>回帰</li>
+        <li>二値分類</li>
+        <li>多クラス分類</li>
+        <li>pairwise ranking</li>
+        <li>NDCG指向ranking</li>
+        <li>quantile回帰</li>
+      </ul>
+
+      <h3>1.3 対象外</h3>
+
+      <ul>
+        <li>注文執行アルゴリズム</li>
+        <li>完全なportfolio optimization</li>
+        <li>バックテスト約定シミュレーション</li>
+        <li>リアルタイム特徴量配信基盤</li>
+        <li>未知の分布変化に対する無条件の性能保証</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>2. 設計原則</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>原則</th>
+            <th>設計方針</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>ロバスト性</td>
+            <td>
+              Student-t objectiveを標準とし、MM majorizationで安定した正曲率を構成する。
+            </td>
+          </tr>
+          <tr>
+            <td>era中心</td>
+            <td>
+              サンプル平均ではなく、era内正規化損失とera-level DROを基本単位とする。
+            </td>
+          </tr>
+          <tr>
+            <td>リーク防止</td>
+            <td>
+              カテゴリ統計はtarget maturity、purge、embargoを満たす過去データだけから生成する。
+            </td>
+          </tr>
+          <tr>
+            <td>目的関数整合性</td>
+            <td>
+              分割、葉値、木の受理を可能な限り同一の統合objectiveに整合させる。
+            </td>
+          </tr>
+          <tr>
+            <td>保守的木探索</td>
+            <td>
+              全体利得だけでなく、era別利得の下側DRO値とera coverageを評価する。
+            </td>
+          </tr>
+          <tr>
+            <td>運用可能性</td>
+            <td>
+              factor exposureと予測turnoverを学習正則化へ組み込む。
+            </td>
+          </tr>
+          <tr>
+            <td>安全な近似</td>
+            <td>
+              近似Hessianで木を生成した後、完全objectiveのline searchで受理を決定する。
+            </td>
+          </tr>
+          <tr>
+            <td>再現性</td>
+            <td>
+              データ順序、乱数seed、fold、binning、pair samplingをモデル成果物へ保存する。
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>3. システム構成</h2>
+
+      <pre><code class="language-text">User API
+  |
+  +-- Dataset / Schema Validation
+  |
+  +-- Time Information &amp; Leakage Guard
+  |
+  +-- Ordered Feature Encoder
+  |
+  +-- Training Coordinator
+        |
+        +-- Objective Engine
+        +-- Era-DRO Solver
+        +-- Financial Regularizer Engine
+        +-- Gradient / Curvature Composer
+        +-- Histogram Builder
+        +-- Robust Split Evaluator
+        +-- Tree Builder
+        +-- Exact Line Search
+        +-- Validation / Early Stopping
+  |
+  +-- Prediction &amp; Optional Neutralization
+  |
+  +-- Model Serialization / Diagnostics</code></pre>
+
+      <h3>3.1 論理レイヤー</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>レイヤー</th>
+            <th>責務</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>APIレイヤー</td>
+            <td>回帰、分類、rankingの統一されたfit・predict APIを提供する。</td>
+          </tr>
+          <tr>
+            <td>データレイヤー</td>
+            <td>特徴量、target、era、instrument、factor、時刻、horizonを保持する。</td>
+          </tr>
+          <tr>
+            <td>時系列安全レイヤー</td>
+            <td>target maturity、purge、embargo、ordered encodingを管理する。</td>
+          </tr>
+          <tr>
+            <td>目的関数レイヤー</td>
+            <td>損失、勾配、曲率、完全objective評価を提供する。</td>
+          </tr>
+          <tr>
+            <td>金融正則化レイヤー</td>
+            <td>DRO、factor neutrality、turnover、era downsideを計算する。</td>
+          </tr>
+          <tr>
+            <td>木学習レイヤー</td>
+            <td>binning、histogram、split探索、coverage prior、葉値計算を行う。</td>
+          </tr>
+          <tr>
+            <td>検証レイヤー</td>
+            <td>walk-forward評価、Numerai型指標、early stoppingを担当する。</td>
+          </tr>
+          <tr>
+            <td>永続化レイヤー</td>
+            <td>モデル、カテゴリ状態、bin境界、factor operator、metadataを保存する。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>4. パッケージ基本構成</h2>
+
+      <pre><code class="language-text">fortgbm/
+├── api/
+│   ├── regressor
+│   ├── classifier
+│   ├── ranker
+│   └── quantile_regressor
+├── data/
+│   ├── dataset
+│   ├── schema
+│   ├── temporal_index
+│   └── validation
+├── encoding/
+│   ├── ordered_encoder
+│   ├── robust_category_stat
+│   └── category_state
+├── objectives/
+│   ├── base
+│   ├── student_t
+│   ├── regression
+│   ├── classification
+│   ├── ranking
+│   └── quantile
+├── robust/
+│   ├── era_dro
+│   ├── cvar
+│   └── downside
+├── finance/
+│   ├── factor_penalty
+│   ├── turnover_penalty
+│   ├── neutralization
+│   └── portfolio_operator
+├── tree/
+│   ├── binning
+│   ├── histogram
+│   ├── split
+│   ├── coverage_prior
+│   ├── builder
+│   └── tree_model
+├── training/
+│   ├── coordinator
+│   ├── curvature
+│   ├── line_search
+│   ├── early_stopping
+│   └── callbacks
+├── metrics/
+│   ├── regression
+│   ├── classification
+│   ├── ranking
+│   └── financial
+├── validation/
+│   ├── purged_walk_forward
+│   ├── embargo
+│   └── bootstrap
+├── serialization/
+│   ├── model_io
+│   └── model_schema
+└── diagnostics/
+    ├── training_log
+    ├── era_report
+    ├── exposure_report
+    └── split_report</code></pre>
+    </section>
+
+    <section>
+      <h2>5. データモデル</h2>
+
+      <h3>5.1 必須入力</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>項目</th>
+            <th>型・形状</th>
+            <th>必須条件</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>数値特徴量</td>
+            <td>\(X \in \mathbb R^{N\times P}\)</td>
+            <td>推論時点で利用可能であること</td>
+          </tr>
+          <tr>
+            <td>target</td>
+            <td>\(y \in \mathbb R^N\) またはclass ID</td>
+            <td>タスクに適合すること</td>
+          </tr>
+          <tr>
+            <td>era</td>
+            <td>長さ \(N\) の順序付き識別子</td>
+            <td>全サンプルに設定すること</td>
+          </tr>
+          <tr>
+            <td>観測時刻</td>
+            <td>長さ \(N\) のtimestamp</td>
+            <td>ordered機能使用時は必須</td>
+          </tr>
+          <tr>
+            <td>target maturity</td>
+            <td>timestampまたはhorizon</td>
+            <td>時系列リーク防止に使用</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>5.2 任意入力</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>項目</th>
+            <th>用途</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>カテゴリ特徴量</td>
+            <td>strict-past ordered statistics</td>
+          </tr>
+          <tr>
+            <td>instrument ID</td>
+            <td>時系列turnover対応</td>
+          </tr>
+          <tr>
+            <td>factor matrix</td>
+            <td>学習時factor-neutral penalty</td>
+          </tr>
+          <tr>
+            <td>sample weight</td>
+            <td>流動性、信頼度、class imbalanceの表現</td>
+          </tr>
+          <tr>
+            <td>transaction cost</td>
+            <td>instrument・era別turnover係数</td>
+          </tr>
+          <tr>
+            <td>query ID</td>
+            <td>ranking pair生成</td>
+          </tr>
+          <tr>
+            <td>benchmark prediction</td>
+            <td>downside基準、meta-model contribution評価</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>5.3 内部Dataset</h3>
+
+      <pre><code class="language-text">Dataset
+├── numeric_features
+├── categorical_features
+├── target
+├── sample_weight
+├── era_id
+├── era_offsets
+├── observation_time
+├── target_maturity_time
+├── instrument_id
+├── query_id
+├── factor_matrix
+├── transaction_cost
+├── feature_metadata
+├── ordered_encoding_state
+└── histogram_bin_state</code></pre>
+
+      <h3>5.4 不変条件</h3>
+
+      <ul>
+        <li>eraは時間順に全順序または半順序を確定できること</li>
+        <li>sample weightは非負であり、各eraの総重みが正であること</li>
+        <li>factor matrixは学習対象サンプルと行方向に一致すること</li>
+        <li>ranking pairは同一query内に限定すること</li>
+        <li>turnover比較は同一instrumentの連続時点に限定すること</li>
+        <li>未来targetを参照する派生特徴量を受け入れないこと</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>6. 公開API</h2>
+
+      <h3>6.1 Estimator</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>クラス</th>
+            <th>用途</th>
+            <th>主要メソッド</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>FORTRegressor</code></td>
+            <td>回帰</td>
+            <td><code>fit()</code>、<code>predict()</code></td>
+          </tr>
+          <tr>
+            <td><code>FORTClassifier</code></td>
+            <td>二値・多クラス分類</td>
+            <td><code>fit()</code>、<code>predict()</code>、<code>predict_proba()</code></td>
+          </tr>
+          <tr>
+            <td><code>FORTRanker</code></td>
+            <td>pairwise・NDCG ranking</td>
+            <td><code>fit()</code>、<code>predict()</code></td>
+          </tr>
+          <tr>
+            <td><code>FORTQuantileRegressor</code></td>
+            <td>単一・複数量子化点予測</td>
+            <td><code>fit()</code>、<code>predict_quantiles()</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>6.2 共通学習インターフェース</h3>
+
+      <pre><code class="language-python">model.fit(
+    X,
+    y,
+    era=era,
+    observation_time=observation_time,
+    target_maturity_time=target_maturity_time,
+    categorical_feature=categorical_feature,
+    instrument_id=instrument_id,
+    factor_matrix=factor_matrix,
+    sample_weight=sample_weight,
+    transaction_cost=transaction_cost,
+    query_id=query_id,
+    eval_set=eval_set,
+    callbacks=callbacks,
+)</code></pre>
+
+      <h3>6.3 予測インターフェース</h3>
+
+      <pre><code class="language-python">prediction = model.predict(
+    X,
+    era=era,
+    categorical_state=categorical_state,
+    factor_matrix=factor_matrix,
+    neutralize=False,
+)</code></pre>
+
+      <h3>6.4 診断インターフェース</h3>
+
+      <ul>
+        <li><code>get_training_history()</code></li>
+        <li><code>get_era_metrics()</code></li>
+        <li><code>get_factor_exposure()</code></li>
+        <li><code>get_turnover_report()</code></li>
+        <li><code>get_split_diagnostics()</code></li>
+        <li><code>get_leaf_coverage()</code></li>
+        <li><code>save_model()</code></li>
+        <li><code>load_model()</code></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>7. 設定モデル</h2>
+
+      <h3>7.1 主要設定群</h3>
+
+      <pre><code class="language-text">FORTConfig
+├── TaskConfig
+├── ObjectiveConfig
+├── TreeConfig
+├── EraDROConfig
+├── OrderedEncodingConfig
+├── FactorPenaltyConfig
+├── TurnoverConfig
+├── ValidationConfig
+├── NumericalStabilityConfig
+├── ComputeConfig
+└── ReproducibilityConfig</code></pre>
+
+      <h3>7.2 主要パラメータ</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>パラメータ</th>
+            <th>意味</th>
+            <th>初期方針</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>objective</code></td>
+            <td>主損失</td>
+            <td>回帰の標準は<code>student_t</code></td>
+          </tr>
+          <tr>
+            <td><code>student_t_df</code></td>
+            <td>Student-t自由度</td>
+            <td>固定または制約付き推定</td>
+          </tr>
+          <tr>
+            <td><code>student_t_scale</code></td>
+            <td>残差scale</td>
+            <td>globalまたはera階層scale</td>
+          </tr>
+          <tr>
+            <td><code>era_dro_radius</code></td>
+            <td>KL ambiguity半径</td>
+            <td>walk-forwardで選択</td>
+          </tr>
+          <tr>
+            <td><code>era_weight_cap</code></td>
+            <td>敵対era重み上限</td>
+            <td>有限値を標準とする</td>
+          </tr>
+          <tr>
+            <td><code>factor_penalty</code></td>
+            <td>因子露出正則化強度</td>
+            <td>0以上</td>
+          </tr>
+          <tr>
+            <td><code>turnover_penalty</code></td>
+            <td>時間方向正則化強度</td>
+            <td>instrument IDがある場合に有効</td>
+          </tr>
+          <tr>
+            <td><code>min_eras_per_leaf</code></td>
+            <td>最小era effective coverage</td>
+            <td>1より大きい値を要求</td>
+          </tr>
+          <tr>
+            <td><code>coverage_prior_strength</code></td>
+            <td>低coverage葉のL2 precision</td>
+            <td>正値</td>
+          </tr>
+          <tr>
+            <td><code>ordered_encoding</code></td>
+            <td>orderedカテゴリ統計</td>
+            <td>カテゴリ利用時は原則有効</td>
+          </tr>
+          <tr>
+            <td><code>embargo</code></td>
+            <td>target重複防止期間</td>
+            <td>target horizon以上を検討</td>
+          </tr>
+          <tr>
+            <td><code>exact_line_search</code></td>
+            <td>完全objective受理判定</td>
+            <td>標準で有効</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>8. 統合目的関数</h2>
+
+      <p>FORT-GBM v2の基本objectiveを次とする。</p>
+
+      <div class="equation">
+        <div>
+          J(F, σ, ν)
+          =
+          max<sub>q ∈ Q<sub>ρ,κ</sub></sub>
+          Σ<sub>e</sub> q<sub>e</sub>L<sub>e</sub>(F; σ, ν)
+        </div>
+        <div>
+          + λ<sub>down</sub>R<sub>down</sub>(F)
+          + λ<sub>factor</sub>R<sub>factor</sub>(F)
+          + λ<sub>turn</sub>R<sub>turn</sub>(F)
+        </div>
+        <div>
+          + λ<sub>scale</sub>R<sub>scale</sub>(σ)
+          + Σ<sub>m</sub>Ω(f<sub>m</sub>).
+        </div>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>項</th>
+            <th>責務</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>\(L_e\)</td>
+            <td>era内正規化されたtask loss</td>
+          </tr>
+          <tr>
+            <td>\(Q_{\rho,\kappa}\)</td>
+            <td>KL半径とera weight capを持つambiguity set</td>
+          </tr>
+          <tr>
+            <td>\(R_{\mathrm{down}}\)</td>
+            <td>固定benchmarkより悪いeraを抑制</td>
+          </tr>
+          <tr>
+            <td>\(R_{\mathrm{factor}}\)</td>
+            <td>予測の既知factor射影を抑制</td>
+          </tr>
+          <tr>
+            <td>\(R_{\mathrm{turn}}\)</td>
+            <td>同一instrumentの時系列予測変化を抑制</td>
+          </tr>
+          <tr>
+            <td>\(R_{\mathrm{scale}}\)</td>
+            <td>era scaleの過剰変動とcollapseを防止</td>
+          </tr>
+          <tr>
+            <td>\(\Omega\)</td>
+            <td>葉数、深さ、葉値、coverageを正則化</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>8.1 objectiveの評価モード</h3>
+
+      <ul>
+        <li>
+          <strong>surrogate evaluation：</strong>
+          木探索用の勾配・正曲率近似を高速計算する。
+        </li>
+        <li>
+          <strong>exact evaluation：</strong>
+          木追加候補に対して完全objectiveを再計算する。
+        </li>
+        <li>
+          <strong>validation evaluation：</strong>
+          out-of-timeデータ上で金融評価指標を計算する。
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>9. Objective Engine</h2>
+
+      <h3>9.1 共通契約</h3>
+
+      <pre><code class="language-text">Objective
+├── initialize_prediction()
+├── evaluate_loss()
+├── evaluate_era_loss()
+├── gradient()
+├── curvature()
+├── update_auxiliary_parameters()
+├── inverse_link()
+└── validate_target()</code></pre>
+
+      <h3>9.2 提供objective</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>名称</th>
+            <th>用途</th>
+            <th>曲率方式</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>student_t</code></td>
+            <td>主軸となるロバスト回帰</td>
+            <td>MM majorizer</td>
+          </tr>
+          <tr>
+            <td><code>huber</code></td>
+            <td>warm start、軽度の外れ値</td>
+            <td>区分曲率またはsurrogate</td>
+          </tr>
+          <tr>
+            <td><code>mse</code></td>
+            <td>標準回帰・比較基準</td>
+            <td>厳密Hessian</td>
+          </tr>
+          <tr>
+            <td><code>mae</code></td>
+            <td>中央値回帰</td>
+            <td>葉内加重median</td>
+          </tr>
+          <tr>
+            <td><code>smooth_mae</code></td>
+            <td>微分可能なMAE近似</td>
+            <td>厳密正曲率</td>
+          </tr>
+          <tr>
+            <td><code>quantile</code></td>
+            <td>条件付き分位点</td>
+            <td>葉内加重quantile</td>
+          </tr>
+          <tr>
+            <td><code>fair</code></td>
+            <td>有界勾配型回帰</td>
+            <td>厳密正曲率</td>
+          </tr>
+          <tr>
+            <td><code>cauchy</code></td>
+            <td>強いredescending robustness</td>
+            <td>MM majorizer</td>
+          </tr>
+          <tr>
+            <td><code>student_t_binary</code></td>
+            <td>裾の厚いlinkを持つ二値分類</td>
+            <td>Fisher curvature</td>
+          </tr>
+          <tr>
+            <td><code>multivariate_t_utility</code></td>
+            <td>対称な多クラス分類</td>
+            <td>Monte Carlo Fisher近似</td>
+          </tr>
+          <tr>
+            <td><code>student_t_pairwise</code></td>
+            <td>Student-t pairwise ranking</td>
+            <td>Pairwise Fisher curvature</td>
+          </tr>
+          <tr>
+            <td><code>student_t_lambdarank</code></td>
+            <td>NDCG指向ranking</td>
+            <td>反復固定Lambda surrogate</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>9.3 Student-t補助パラメータ更新</h3>
+
+      <p>木更新中は自由度とscaleを固定し、木追加後に更新する。</p>
+
+      <pre><code class="language-text">Tree block:
+    fix sigma and nu
+    update F
+
+Auxiliary block:
+    fix F
+    update sigma
+    optionally update nu
+
+Acceptance block:
+    evaluate full objective
+    accept or roll back</code></pre>
+    </section>
+
+    <section>
+      <h2>10. Era-DRO Solver</h2>
+
+      <h3>10.1 責務</h3>
+
+      <ul>
+        <li>era損失ベクトルの受領</li>
+        <li>基準era分布の構成</li>
+        <li>KL半径とweight capの制約処理</li>
+        <li>最悪分布 \(q^\star\) の計算</li>
+        <li>primal、dual、KKT residualの返却</li>
+      </ul>
+
+      <h3>10.2 ambiguity set</h3>
+
+      <div class="equation">
+        <div>
+          Q<sub>ρ,κ</sub>
+          =
+          {
+          q ≥ 0 :
+          Σ<sub>e</sub>q<sub>e</sub> = 1,
+          D<sub>KL</sub>(q || π) ≤ ρ,
+          q<sub>e</sub> ≤ κπ<sub>e</sub>
+          }.
+        </div>
+      </div>
+
+      <h3>10.3 出力</h3>
+
+      <pre><code class="language-text">EraDROResult
+├── robust_risk
+├── adversarial_era_weight
+├── kl_divergence
+├── active_weight_caps
+├── primal_residual
+├── dual_residual
+└── convergence_status</code></pre>
+
+      <h3>10.4 エラー条件</h3>
+
+      <ul>
+        <li>基準重み \(\pi_e\) が0以下</li>
+        <li>weight capの総容量が1未満</li>
+        <li>KL半径が負</li>
+        <li>era損失にNaNまたは無限値が存在</li>
+        <li>指定反復数内にKKT residualが許容値へ収束しない</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>11. Ordered Encoding</h2>
+
+      <h3>11.1 利用可能な過去集合</h3>
+
+      <div class="equation">
+        <div>
+          P<sub>i</sub>
+          =
+          {
+          j :
+          target_maturity<sub>j</sub> + embargo
+          &lt;
+          observation_time<sub>i</sub>
+          }.
+        </div>
+      </div>
+
+      <p>
+        sample \(i\) のカテゴリ統計は、必ず \(P_i\) の観測だけで構築する。
+      </p>
+
+      <h3>11.2 エンコード種別</h3>
+
+      <ul>
+        <li>過去count</li>
+        <li>時間減衰count</li>
+        <li>平滑化target mean</li>
+        <li>Student-t robust location</li>
+        <li>分類class frequency</li>
+        <li>ranking relevance statistic</li>
+        <li>カテゴリ組合せ統計</li>
+      </ul>
+
+      <h3>11.3 未知カテゴリ</h3>
+
+      <p>推論時の未知カテゴリは次の順序で処理する。</p>
+
+      <ol>
+        <li>カテゴリ階層の親統計</li>
+        <li>低次カテゴリ組合せ統計</li>
+        <li>era非依存global prior</li>
+      </ol>
+
+      <h3>11.4 状態管理</h3>
+
+      <pre><code class="language-text">OrderedEncodingState
+├── category_dictionary
+├── global_prior
+├── historical_count
+├── historical_location
+├── historical_scale
+├── last_maturity_time
+├── time_decay_state
+└── schema_version</code></pre>
+
+      <div class="danger">
+        学習終了時の全targetを集計したカテゴリ統計を過去データの再予測に使ってはならない。
+        学習時、validation時、推論時で、それぞれ情報時点に対応する状態を使用する。
+      </div>
+    </section>
+
+    <section>
+      <h2>12. Financial Regularizer</h2>
+
+      <h3>12.1 Factor penalty</h3>
+
+      <p>
+        eraごとに中心化したfactor matrixへ予測を射影し、
+        射影成分の加重二乗ノルムを罰する。
+      </p>
+
+      <div class="equation">
+        <div>
+          R<sub>factor</sub>(F)
+          =
+          1/2
+          Σ<sub>e</sub>
+          π<sub>e</sub>s<sub>F,e</sub><sup>-2</sup>
+          (C<sub>e</sub>F<sub>e</sub>)<sup>T</sup>
+          W<sub>e</sub>P<sub>e</sub>
+          (C<sub>e</sub>F<sub>e</sub>).
+        </div>
+      </div>
+
+      <p>
+        factor operatorは学習foldだけから構成し、当該木の構築中は固定する。
+      </p>
+
+      <h3>12.2 Turnover penalty</h3>
+
+      <p>
+        固定線形portfolio operatorを \(B_e\) とし、
+        ポジションscoreを \(p_e=B_eF_e\) とする。
+      </p>
+
+      <div class="equation">
+        <div>
+          R<sub>turn</sub>(F)
+          =
+          Σ<sub>e,a</sub>
+          c<sub>a,e</sub>
+          [
+          √(d<sub>a,e</sub><sup>2</sup> + δ<sup>2</sup>) - δ
+          ].
+        </div>
+      </div>
+
+      <p>
+        \(d_{a,e}\) は同一instrumentの連続era間におけるposition score差である。
+      </p>
+
+      <h3>12.3 責務分離</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>処理</th>
+            <th>FORT-GBM内</th>
+            <th>外部portfolio optimizer</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>因子露出penalty</td>
+            <td>対象</td>
+            <td>必要に応じて追加制約</td>
+          </tr>
+          <tr>
+            <td>予測turnover proxy</td>
+            <td>対象</td>
+            <td>実ポジションturnoverを再最適化</td>
+          </tr>
+          <tr>
+            <td>gross・net exposure</td>
+            <td>線形近似のみ</td>
+            <td>厳密制約</td>
+          </tr>
+          <tr>
+            <td>market impact</td>
+            <td>係数による近似</td>
+            <td>非線形費用モデル</td>
+          </tr>
+          <tr>
+            <td>position limit</td>
+            <td>対象外</td>
+            <td>厳密制約</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>13. Tree Builder</h2>
+
+      <h3>13.1 木成長方式</h3>
+
+      <p>
+        leaf-wise成長を基本とし、最大深さ、最大葉数、
+        最小曲率、最小era coverageによって制限する。
+      </p>
+
+      <h3>13.2 Histogram統計</h3>
+
+      <p>各feature bin、node、eraについて次を保持する。</p>
+
+      <pre><code class="language-text">EraHistogramBin
+├── gradient_sum
+├── curvature_sum
+├── sample_count
+├── sample_weight_sum
+├── recent_era_flag
+└── missing_value_count</code></pre>
+
+      <p>
+        era別統計を全binへ無制限に保持するとメモリ量が増大するため、
+        詳細設計では次のモードを提供する。
+      </p>
+
+      <ul>
+        <li><strong>exact-era：</strong>全era統計を保持</li>
+        <li><strong>era-block：</strong>隣接eraをblock化</li>
+        <li><strong>top-era：</strong>主要eraと残余集約を保持</li>
+      </ul>
+
+      <p>標準仕様および検証基準は<code>exact-era</code>とする。</p>
+
+      <h3>13.3 Missing value</h3>
+
+      <p>
+        欠損値は独立binとして集計し、左・右の両方向を候補評価する。
+        欠損方向もera-robust split scoreに基づいて決定する。
+      </p>
+
+      <h3>13.4 カテゴリ分割</h3>
+
+      <p>
+        カテゴリはordered statisticまたはカテゴリbinへ変換し、
+        target maturity条件を満たす状態だけを使う。
+        生target平均による全期間カテゴリ並べ替えは禁止する。
+      </p>
+    </section>
+
+    <section>
+      <h2>14. Robust Split Evaluator</h2>
+
+      <h3>14.1 葉統計</h3>
+
+      <div class="equation">
+        <div>
+          G<sub>A,e</sub>
+          =
+          Σ<sub>i∈A,e<sub>i</sub>=e</sub>G<sub>i</sub>,
+          &nbsp;&nbsp;
+          H<sub>A,e</sub>
+          =
+          Σ<sub>i∈A,e<sub>i</sub>=e</sub>H<sub>i</sub>.
+        </div>
+      </div>
+
+      <h3>14.2 Era effective coverage</h3>
+
+      <div class="equation">
+        <div>
+          u<sub>A,e</sub>
+          =
+          H<sub>A,e</sub> / (H<sub>A</sub> + ε),
+          &nbsp;&nbsp;
+          N<sub>eff,A</sub>
+          =
+          1 / (Σ<sub>e</sub>u<sub>A,e</sub><sup>2</sup> + ε).
+        </div>
+      </div>
+
+      <p>
+        sample countではなく曲率質量を使用し、
+        objective上の情報量が一部eraへ集中する葉を検出する。
+      </p>
+
+      <h3>14.3 Coverage prior</h3>
+
+      <div class="equation">
+        <div>
+          λ<sub>A,total</sub>
+          =
+          λ<sub>2</sub>
+          +
+          λ<sub>A,coverage</sub>.
+        </div>
+      </div>
+
+      <p>葉値は次の凸部分問題の解とする。</p>
+
+      <div class="equation">
+        <div>
+          v<sub>A</sub>
+          =
+          -SoftThreshold(G<sub>A</sub>, λ<sub>1</sub>)
+          /
+          (H<sub>A</sub> + λ<sub>A,total</sub>).
+        </div>
+      </div>
+
+      <h3>14.4 Era別改善量</h3>
+
+      <p>
+        親葉と左右子葉の共通葉値を用いて、各eraのsurrogate改善量
+        \(\Delta_e\) を計算する。
+      </p>
+
+      <h3>14.5 Robust lower gain</h3>
+
+      <div class="equation">
+        <div>
+          G<sub>robust</sub>
+          =
+          min<sub>q∈Q<sub>split</sub></sub>
+          Σ<sub>e</sub>q<sub>e</sub>Δ<sub>e</sub>.
+        </div>
+      </div>
+
+      <h3>14.6 Split score</h3>
+
+      <div class="equation">
+        <div>
+          Score
+          =
+          G<sub>robust</sub>
+          - ΔΩ
+          - κ<sub>neg</sub>Σ<sub>e</sub>π<sub>e</sub>(-Δ<sub>e</sub>)<sub>+</sub>
+          - κ<sub>disp</sub>MAD(Δ).
+        </div>
+      </div>
+
+      <h3>14.7 Split採用条件</h3>
+
+      <ul>
+        <li>split scoreが正</li>
+        <li>左右の総曲率が下限以上</li>
+        <li>左右のeffective era coverageが下限以上</li>
+        <li>最近eraの支持率が下限以上</li>
+        <li>最大深さと最大葉数の範囲内</li>
+        <li>monotonic constraintに違反しない</li>
+        <li>interaction constraintに違反しない</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>15. 学習制御</h2>
+
+      <h3>15.1 1回のboosting反復</h3>
+
+      <pre><code class="language-text">1. 現在予測を固定
+2. Student-t scale・自由度を必要に応じて更新
+3. era損失を計算
+4. capped KL-DROを解く
+5. task gradientとcurvatureを計算
+6. factor・turnover・downsideの勾配を合成
+7. PSDまたは対角majorizerを構成
+8. histogramを生成
+9. era-robust splitで木を構築
+10. coverage priorから葉値を計算
+11. 完全objective上でline search
+12. 木を受理または棄却
+13. validation指標を更新
+14. early stoppingを判定</code></pre>
+
+      <h3>15.2 Line search</h3>
+
+      <div class="equation">
+        <div>
+          α<sup>*</sup>
+          =
+          arg min<sub>0≤α≤α<sub>max</sub></sub>
+          J(F + αf).
+        </div>
+      </div>
+
+      <p>標準実装はbacktracking Armijo searchとする。</p>
+
+      <ol>
+        <li>初期stepを設定する</li>
+        <li>候補予測を生成する</li>
+        <li>DRO内側問題を再最適化する</li>
+        <li>完全objectiveを評価する</li>
+        <li>Armijo条件を満たさなければstepを縮小する</li>
+        <li>最小step未満なら木を棄却する</li>
+      </ol>
+
+      <h3>15.3 Rollback</h3>
+
+      <p>木の受理前に次をcheckpointする。</p>
+
+      <ul>
+        <li>予測ベクトル</li>
+        <li>Student-t scale・自由度</li>
+        <li>DRO状態</li>
+        <li>ordered stateの参照version</li>
+        <li>training history</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>16. タスク別設計</h2>
+
+      <h3>16.1 回帰</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>項目</th>
+            <th>仕様</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>標準objective</td>
+            <td><code>student_t</code></td>
+          </tr>
+          <tr>
+            <td>初期値</td>
+            <td>Student-t locationまたは加重median</td>
+          </tr>
+          <tr>
+            <td>標準出力</td>
+            <td>location prediction</td>
+          </tr>
+          <tr>
+            <td>任意出力</td>
+            <td>scale、分位点、era内rank</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>16.2 二値分類</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>項目</th>
+            <th>仕様</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>標準objective</td>
+            <td><code>student_t_binary</code></td>
+          </tr>
+          <tr>
+            <td>link</td>
+            <td>Student-t CDF</td>
+          </tr>
+          <tr>
+            <td>曲率</td>
+            <td>Fisher curvature</td>
+          </tr>
+          <tr>
+            <td>出力</td>
+            <td>raw score、class probability、class label</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>16.3 多クラス分類</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>モード</th>
+            <th>用途</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>multivariate_t_utility</code></td>
+            <td>理論的に対称な標準モード</td>
+          </tr>
+          <tr>
+            <td><code>ovr_t_approximation</code></td>
+            <td>大規模データ向け近似モード</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>16.4 Ranking</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>モード</th>
+            <th>仕様</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>student_t_pairwise</code></td>
+            <td>共有Gamma scale-mixtureに基づくpairwise likelihood</td>
+          </tr>
+          <tr>
+            <td><code>student_t_lambdarank</code></td>
+            <td>反復開始時にNDCG pair weightを固定するsurrogate</td>
+          </tr>
+          <tr>
+            <td>pair sampling</td>
+            <td>抽出確率による逆確率補正を使用</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>16.5 Quantile回帰</h3>
+
+      <ul>
+        <li>exact pinball lossでは葉内加重quantileを使用</li>
+        <li>smooth quantileでは二階木学習を使用</li>
+        <li>複数量子化点ではcrossing penaltyまたはlocation-scale形式を使用</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>17. ValidationとEarly Stopping</h2>
+
+      <h3>17.1 検証方式</h3>
+
+      <p>purged walk-forwardを標準方式とする。</p>
+
+      <div class="equation">
+        <div>
+          Train<sub>k</sub>
+          =
+          {
+          i :
+          target_maturity<sub>i</sub> + embargo
+          &lt;
+          validation_start<sub>k</sub>
+          }.
+        </div>
+      </div>
+
+      <h3>17.2 主要指標</h3>
+
+      <ul>
+        <li>平均era loss</li>
+        <li>worst-era loss</li>
+        <li>era-CVaR</li>
+        <li>era correlation</li>
+        <li>feature-neutral correlation</li>
+        <li>era scoreのHAC補正Sharpe</li>
+        <li>最大drawdown</li>
+        <li>factor exposure</li>
+        <li>turnover</li>
+        <li>費用控除後utility</li>
+      </ul>
+
+      <h3>17.3 Early stopping score</h3>
+
+      <div class="equation">
+        <div>
+          U<sub>val</sub>
+          =
+          mean(S<sub>e</sub>)
+          - κ<sub>std</sub>std(S<sub>e</sub>)
+          - κ<sub>tail</sub>CVaR(-S<sub>e</sub>)
+          - κ<sub>turn</sub>Turnover
+          - κ<sub>factor</sub>Exposure.
+        </div>
+      </div>
+
+      <p>
+        複数foldの平均値ではなく、中央値または下側信頼限界を標準選択基準とする。
+      </p>
+
+      <h3>17.4 禁止事項</h3>
+
+      <ul>
+        <li>ランダムK-foldによる金融時系列評価</li>
+        <li>validation targetを用いたカテゴリ統計更新</li>
+        <li>validation期間を用いたfactor operator推定</li>
+        <li>validation結果に基づく無制限の反復的特徴量選択</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>18. 推論設計</h2>
+
+      <h3>18.1 Batch prediction</h3>
+
+      <ol>
+        <li>入力schemaを検証する</li>
+        <li>保存済みbin境界を適用する</li>
+        <li>利用可能時点のordered encoding stateを適用する</li>
+        <li>全木の葉値を加算する</li>
+        <li>task linkを適用する</li>
+        <li>任意でfactor neutralizationを適用する</li>
+        <li>任意でera内rank変換を適用する</li>
+      </ol>
+
+      <h3>18.2 Online state update</h3>
+
+      <p>
+        targetが成熟した時点でのみordered stateを更新する。
+      </p>
+
+      <pre><code class="language-text">observe features
+    |
+predict
+    |
+wait until target maturity
+    |
+receive target
+    |
+validate maturity and ordering
+    |
+update ordered encoding state</code></pre>
+
+      <h3>18.3 Point-in-time再現</h3>
+
+      <p>
+        任意の過去時点における予測を再現できるよう、
+        ordered stateにversionと有効時刻を保持する。
+      </p>
+    </section>
+
+    <section>
+      <h2>19. モデル永続化</h2>
+
+      <h3>19.1 保存対象</h3>
+
+      <ul>
+        <li>木構造と葉値</li>
+        <li>特徴量schema</li>
+        <li>bin境界</li>
+        <li>カテゴリ辞書</li>
+        <li>ordered encoding state</li>
+        <li>Student-t自由度とscale</li>
+        <li>factor operator定義</li>
+        <li>portfolio operator定義</li>
+        <li>objective設定</li>
+        <li>学習foldとembargo情報</li>
+        <li>乱数seed</li>
+        <li>ライブラリ・model schema version</li>
+      </ul>
+
+      <h3>19.2 互換性</h3>
+
+      <ul>
+        <li>major version不一致は原則読み込み拒否</li>
+        <li>minor version差はmigration可否を明示</li>
+        <li>未知フィールドは保持可能だが、意味の不明な必須フィールドは拒否</li>
+        <li>model checksumを保存</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>20. ログと診断</h2>
+
+      <h3>20.1 反復ログ</h3>
+
+      <pre><code class="language-text">TrainingIterationLog
+├── iteration
+├── train_objective
+├── robust_era_risk
+├── validation_utility
+├── adversarial_era_weight_summary
+├── student_t_df
+├── student_t_scale_summary
+├── factor_penalty
+├── turnover_penalty
+├── tree_leaf_count
+├── tree_max_depth
+├── minimum_leaf_era_coverage
+├── line_search_step
+├── rejected_tree_count
+└── elapsed_time</code></pre>
+
+      <h3>20.2 Split診断</h3>
+
+      <ul>
+        <li>標準aggregate gain</li>
+        <li>robust lower gain</li>
+        <li>negative-era比率</li>
+        <li>era利得MAD</li>
+        <li>左右のeffective coverage</li>
+        <li>coverage prior precision</li>
+        <li>最近era支持率</li>
+      </ul>
+
+      <h3>20.3 警告</h3>
+
+      <ul>
+        <li>DRO weightがcapへ大量に張り付く</li>
+        <li>Student-t自由度が境界値へ張り付く</li>
+        <li>scaleが下限へ接近する</li>
+        <li>factor matrixが悪条件</li>
+        <li>多くの木がline searchで棄却される</li>
+        <li>leaf coverageが継続的に下限付近</li>
+        <li>ordered categoryの未知率が高い</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>21. エラー処理</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>分類</th>
+            <th>例</th>
+            <th>処理</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>入力不正</td>
+            <td>era欠落、負のweight、時刻不整合</td>
+            <td>学習開始前に停止</td>
+          </tr>
+          <tr>
+            <td>リーク危険</td>
+            <td>target maturityが観測時刻以前に定義不能</td>
+            <td>原則停止</td>
+          </tr>
+          <tr>
+            <td>数値不安定</td>
+            <td>NaN、無限大、scale collapse</td>
+            <td>rollback後に停止または安全設定で再試行</td>
+          </tr>
+          <tr>
+            <td>DRO未収束</td>
+            <td>KKT residual超過</td>
+            <td>反復延長後も未収束なら木を棄却</td>
+          </tr>
+          <tr>
+            <td>line search失敗</td>
+            <td>最小stepでもobjective非減少</td>
+            <td>木を棄却し、棄却回数を記録</td>
+          </tr>
+          <tr>
+            <td>validation劣化</td>
+            <td>utility LCBが継続悪化</td>
+            <td>early stoppingし最良iterationへ戻す</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>22. 性能・拡張性設計</h2>
+
+      <h3>22.1 計算量の主要因</h3>
+
+      <ul>
+        <li>feature binning</li>
+        <li>era別histogram</li>
+        <li>splitごとのrobust gain評価</li>
+        <li>DRO内側最適化</li>
+        <li>factor・turnover非分離勾配</li>
+        <li>ranking pair生成</li>
+        <li>line search時の完全objective再評価</li>
+      </ul>
+
+      <h3>22.2 最適化方針</h3>
+
+      <ul>
+        <li>数値特徴量の量子化とhistogram subtraction</li>
+        <li>era offsetによる連続メモリ配置</li>
+        <li>疎factor matrix対応</li>
+        <li>instrument対応行列の疎表現</li>
+        <li>DRO solverのwarm start</li>
+        <li>line search候補の予測差分更新</li>
+        <li>ranking pairのimportance sampling</li>
+        <li>CPU並列を初期標準とし、GPUは後続段階で追加</li>
+      </ul>
+
+      <h3>22.3 並列化境界</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>処理</th>
+            <th>並列化単位</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>binning</td>
+            <td>featureまたはrow block</td>
+          </tr>
+          <tr>
+            <td>histogram</td>
+            <td>feature、node、era block</td>
+          </tr>
+          <tr>
+            <td>split評価</td>
+            <td>feature</td>
+          </tr>
+          <tr>
+            <td>factor penalty</td>
+            <td>era</td>
+          </tr>
+          <tr>
+            <td>turnover penalty</td>
+            <td>instrument block</td>
+          </tr>
+          <tr>
+            <td>validation</td>
+            <td>fold</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>23. セキュリティと再現性</h2>
+
+      <ul>
+        <li>モデル読込時にschema versionとchecksumを検証する</li>
+        <li>任意コード実行を伴うserialization形式を標準にしない</li>
+        <li>学習データの行identifierをモデルへ保存しない</li>
+        <li>乱数生成器とseedを明示的に管理する</li>
+        <li>決定論モードでは並列reduce順序を固定する</li>
+        <li>全設定と自動補正値をtraining manifestへ保存する</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>24. テスト基本設計</h2>
+
+      <h3>24.1 数学テスト</h3>
+
+      <ul>
+        <li>有限差分による全objective勾配検証</li>
+        <li>Student-t MM上界の成立検証</li>
+        <li>factor Hessianの半正定値検証</li>
+        <li>turnover Hessianの半正定値検証</li>
+        <li>DRO primal・dual一致検証</li>
+        <li>cap付きDROのKKT条件検証</li>
+        <li>coverage leaf valueの最適性検証</li>
+        <li>line search後の完全objective非増加検証</li>
+      </ul>
+
+      <h3>24.2 リークテスト</h3>
+
+      <ul>
+        <li>未来targetを変更しても過去OTSが不変</li>
+        <li>同一era targetを変更しても当該era OTSが不変</li>
+        <li>未成熟targetがOTSへ反映されない</li>
+        <li>validation target変更が学習特徴へ影響しない</li>
+      </ul>
+
+      <h3>24.3 機能テスト</h3>
+
+      <ul>
+        <li>全objectiveでfit・predictが完了</li>
+        <li>分類確率の総和が1</li>
+        <li>quantile出力の順序整合</li>
+        <li>ranking pairがqueryを跨がない</li>
+        <li>serialization前後で予測が一致</li>
+      </ul>
+
+      <h3>24.4 ロバスト性テスト</h3>
+
+      <ul>
+        <li>極端なtarget追加時の木構造変化</li>
+        <li>単一era汚染時のDRO weight cap</li>
+        <li>低coverage偽signalの分割拒否</li>
+        <li>既知factor注入時の露出抑制</li>
+        <li>instrument score反転時のturnover抑制</li>
+      </ul>
+
+      <h3>24.5 回帰テスト</h3>
+
+      <ul>
+        <li>固定seedでモデルchecksumが一致</li>
+        <li>既知データでvalidation metricが許容範囲内</li>
+        <li>性能最適化後も数学テスト結果が不変</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>25. 受入基準</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>受入条件</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>AC-01</td>
+            <td>回帰、二値分類、rankingの主要APIが動作すること</td>
+          </tr>
+          <tr>
+            <td>AC-02</td>
+            <td>指定された最低限の回帰objectiveをすべて提供すること</td>
+          </tr>
+          <tr>
+            <td>AC-03</td>
+            <td>ordered encodingがtarget maturityとembargoを遵守すること</td>
+          </tr>
+          <tr>
+            <td>AC-04</td>
+            <td>capped KL-DRO solverがKKT許容誤差内で収束すること</td>
+          </tr>
+          <tr>
+            <td>AC-05</td>
+            <td>全受理木について完全objectiveが非増加であること</td>
+          </tr>
+          <tr>
+            <td>AC-06</td>
+            <td>低era coverage葉に追加L2 precisionが適用されること</td>
+          </tr>
+          <tr>
+            <td>AC-07</td>
+            <td>factor penalty有効時に指定factor露出が基準モデルより低下すること</td>
+          </tr>
+          <tr>
+            <td>AC-08</td>
+            <td>turnover penalty増加時に予測turnoverが非増加傾向を示すこと</td>
+          </tr>
+          <tr>
+            <td>AC-09</td>
+            <td>purged walk-forward validationを標準提供すること</td>
+          </tr>
+          <tr>
+            <td>AC-10</td>
+            <td>保存・再読込後の予測が数値許容誤差内で一致すること</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>26. 開発フェーズ</h2>
+
+      <h3>Phase 1：数学コア</h3>
+
+      <ul>
+        <li>Datasetとschema validation</li>
+        <li>Student-t、MSE、Huber、MAE、quantile、Fair、Cauchy</li>
+        <li>CPU histogram tree</li>
+        <li>Student-t MM</li>
+        <li>exact line search</li>
+      </ul>
+
+      <h3>Phase 2：Era robustness</h3>
+
+      <ul>
+        <li>era正規化</li>
+        <li>capped KL-DRO</li>
+        <li>era-robust split</li>
+        <li>coverage-dependent leaf prior</li>
+      </ul>
+
+      <h3>Phase 3：時系列安全性</h3>
+
+      <ul>
+        <li>target maturity管理</li>
+        <li>purge・embargo</li>
+        <li>ordered categorical statistics</li>
+        <li>expanding-window cross-fitting</li>
+      </ul>
+
+      <h3>Phase 4：金融正則化</h3>
+
+      <ul>
+        <li>factor-neutral penalty</li>
+        <li>turnover penalty</li>
+        <li>Numerai型metrics</li>
+      </ul>
+
+      <h3>Phase 5：タスク拡張</h3>
+
+      <ul>
+        <li>Student-t binary classification</li>
+        <li>Student-t pairwise ranking</li>
+        <li>LambdaRank surrogate</li>
+        <li>多クラスStudent-t utility</li>
+      </ul>
+
+      <h3>Phase 6：高速化</h3>
+
+      <ul>
+        <li>SIMD</li>
+        <li>分散histogram</li>
+        <li>GPU binning・histogram</li>
+        <li>out-of-core dataset</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>27. v2基本仕様の確定事項</h2>
+
+      <ol>
+        <li>回帰の標準objectiveはStudent-tとする。</li>
+        <li>Student-t木構築にはMM majorizerを使用する。</li>
+        <li>era損失はera内で正規化する。</li>
+        <li>DROはKL半径と敵対era weight capを持つ。</li>
+        <li>カテゴリ統計はtarget maturityを満たすstrict-pastデータだけで作る。</li>
+        <li>splitはera別改善量のrobust lower gainで評価する。</li>
+        <li>葉縮小はcoverage-dependent priorとして目的関数へ組み込む。</li>
+        <li>factor penaltyはPSD二次形式とする。</li>
+        <li>turnover penaltyは固定線形operator上の凸smooth-L1とする。</li>
+        <li>近似木は完全objectiveのline searchで受理する。</li>
+        <li>validationはpurged walk-forwardを標準とする。</li>
+        <li>学習状態、時系列状態、数値設定をモデル成果物へ保存する。</li>
+      </ol>
+
+      <div class="definition">
+        FORT-GBM v2の中心設計は、
+        「Student-tでサンプル外れ値を抑え、capped era-DROでregime集中を抑え、
+        ordered learningで未来リークを防ぎ、robust splitとcoverage priorで木構造の偶然適合を抑え、
+        factor・turnover正則化で金融運用上の制約を学習へ統合し、
+        exact line searchで近似更新の破綻を拒否する」
+        という一貫した構造である。
+      </div>
+    </section>
+  </article>
+</body>
+</html>

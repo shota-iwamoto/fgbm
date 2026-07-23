@@ -1,0 +1,3008 @@
+<!-- File: fort_gbm_v2_cpp_gpu_detailed_design.html -->
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FORT-GBM v2 C++・GPU拡張 詳細設計書</title>
+  <style>
+    :root {
+      --ink: #172033;
+      --heading: #102a43;
+      --accent: #285f9e;
+      --border: #bcccdc;
+      --panel: #f5f8fb;
+      --note: #edf7f2;
+      --warning: #fff4e5;
+      --danger: #fff0f0;
+      --code-bg: #172033;
+      --code-fg: #f1f5f9;
+    }
+
+    body {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 32px;
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.72;
+    }
+
+    h1,
+    h2,
+    h3,
+    h4 {
+      color: var(--heading);
+      line-height: 1.35;
+    }
+
+    h2 {
+      margin-top: 48px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid var(--border);
+    }
+
+    h3 {
+      margin-top: 30px;
+    }
+
+    h4 {
+      margin-top: 22px;
+    }
+
+    table {
+      width: 100%;
+      margin: 18px 0;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    th {
+      background: #eaf0f6;
+      text-align: left;
+    }
+
+    code {
+      font-family: "SFMono-Regular", Consolas, monospace;
+    }
+
+    pre {
+      padding: 16px;
+      overflow-x: auto;
+      color: var(--code-fg);
+      background: var(--code-bg);
+      border-radius: 6px;
+      line-height: 1.5;
+    }
+
+    .equation {
+      margin: 16px 0;
+      padding: 14px 18px;
+      overflow-x: auto;
+      background: var(--panel);
+      border-left: 4px solid var(--accent);
+    }
+
+    .definition {
+      margin: 16px 0;
+      padding: 14px 18px;
+      background: var(--note);
+      border-left: 4px solid #237a57;
+    }
+
+    .warning {
+      margin: 16px 0;
+      padding: 14px 18px;
+      background: var(--warning);
+      border-left: 4px solid #d98e1f;
+    }
+
+    .danger {
+      margin: 16px 0;
+      padding: 14px 18px;
+      background: var(--danger);
+      border-left: 4px solid #b23b3b;
+    }
+
+    .small {
+      color: #52616f;
+      font-size: 0.92rem;
+    }
+  </style>
+</head>
+<body>
+  <article>
+    <header>
+      <h1>FORT-GBM v2 C++・GPU拡張 詳細設計書</h1>
+      <p>Financial Ordered Robust Student-t Gradient Boosting Machine</p>
+      <p>
+        C++20による計算コア、CPU並列実行、CUDA/HIPを中心とするGPUバックエンド、
+        複数GPU分散、Python binding、永続化、数値再現性および障害時fallbackを定義する。
+      </p>
+
+      <div class="warning">
+        GPU実装はCPU版と同一の数学的目的関数を評価する。
+        ただし浮動小数点reduce順序、近似histogram、特殊関数実装、
+        era圧縮モードによってbit単位の一致は保証されない。
+        決定論モードでは固定reduce方式を使用し、許容誤差内の数値一致を保証対象とする。
+      </div>
+    </header>
+
+    <section>
+      <h2>1. 設計目標</h2>
+
+      <h3>1.1 機能目標</h3>
+      <ul>
+        <li>回帰、分類、ranking、quantileを単一のC++コアで実行する。</li>
+        <li>Student-t MM objectiveを標準実装する。</li>
+        <li>capped era-level KL-DROをCPU・GPU双方で実行可能にする。</li>
+        <li>era別histogramとrobust splitをCPU・GPUへ実装する。</li>
+        <li>factor penaltyとturnover penaltyを疎演算として実装する。</li>
+        <li>target maturityを遵守するordered categorical encodingを提供する。</li>
+        <li>完全目的関数line searchによって候補木を受理または棄却する。</li>
+        <li>単一GPU、複数GPU、CPU fallbackを同一APIから選択できるようにする。</li>
+      </ul>
+
+      <h3>1.2 非機能目標</h3>
+      <ul>
+        <li>C++20、RAII、例外安全、明示的所有権を基本とする。</li>
+        <li>CPU/GPU間の不要な同期と転送を避ける。</li>
+        <li>GPUメモリ不足時に安全な分割実行またはCPU fallbackを行う。</li>
+        <li>決定論モードと高速非決定論モードを分離する。</li>
+        <li>公開ABIを薄いC ABIで安定化し、内部C++ ABIへ依存させない。</li>
+        <li>モデル形式をCPU/GPUに依存させない。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>2. 対応プラットフォーム</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>区分</th>
+            <th>初期対応</th>
+            <th>拡張</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>OS</td>
+            <td>Linux x86-64、Windows x86-64</td>
+            <td>Linux ARM64</td>
+          </tr>
+          <tr>
+            <td>CPU compiler</td>
+            <td>GCC、Clang、MSVC</td>
+            <td>Intel oneAPI compiler</td>
+          </tr>
+          <tr>
+            <td>CPU SIMD</td>
+            <td>AVX2、AVX-512、NEON抽象</td>
+            <td>SVE</td>
+          </tr>
+          <tr>
+            <td>NVIDIA GPU</td>
+            <td>CUDA、compute capability 7.0以上</td>
+            <td>最新architectureへの特殊化</td>
+          </tr>
+          <tr>
+            <td>AMD GPU</td>
+            <td>バックエンド抽象を先行実装</td>
+            <td>HIP/ROCm正式対応</td>
+          </tr>
+          <tr>
+            <td>分散通信</td>
+            <td>NCCL、MPIまたはTCP collective</td>
+            <td>RCCL、UCX</td>
+          </tr>
+          <tr>
+            <td>Python</td>
+            <td>CPython、pybind11</td>
+            <td>limited C API wheel</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>3. C++アーキテクチャ</h2>
+
+      <pre><code class="language-text">Python / C API
+    |
+    v
+Public Estimator Facade
+    |
+    +-- Configuration Validator
+    +-- Dataset Builder
+    +-- Backend Selector
+    |
+    v
+Training Coordinator
+    |
+    +-- Objective Engine
+    +-- Era-DRO Solver
+    +-- Financial Regularizer Engine
+    +-- Derivative Composer
+    +-- Tree Trainer
+    +-- Exact Objective Evaluator
+    +-- Line Search
+    +-- Validation Coordinator
+    |
+    v
+Execution Backend
+    |
+    +-- CPU Backend
+    |     +-- Thread Pool
+    |     +-- SIMD Kernels
+    |     +-- CPU Histogram
+    |
+    +-- CUDA Backend
+    |     +-- CUDA Streams
+    |     +-- Device Memory Pool
+    |     +-- GPU Objective Kernels
+    |     +-- GPU Histogram
+    |     +-- GPU Split Evaluation
+    |     +-- GPU Prediction
+    |
+    +-- HIP Backend
+          +-- CUDA-compatible abstract operations</code></pre>
+
+      <h3>3.1 設計原則</h3>
+      <ul>
+        <li>数学ロジックとexecution backendを分離する。</li>
+        <li>CPUとGPUで同一の設定、モデル、診断形式を使用する。</li>
+        <li>GPU kernelの直接呼出しを上位training層へ露出しない。</li>
+        <li>backend固有型を公開APIへ持ち込まない。</li>
+        <li>device同期はbackend API内に閉じ込める。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>4. ディレクトリ構成</h2>
+
+      <pre><code class="language-text">fortgbm/
+├── CMakeLists.txt
+├── cmake/
+│   ├── DetectSIMD.cmake
+│   ├── EnableCUDA.cmake
+│   ├── EnableHIP.cmake
+│   └── CompilerWarnings.cmake
+├── include/
+│   └── fortgbm/
+│       ├── api/
+│       │   ├── estimator.hpp
+│       │   ├── predictor.hpp
+│       │   └── c_api.h
+│       ├── core/
+│       │   ├── types.hpp
+│       │   ├── status.hpp
+│       │   ├── span.hpp
+│       │   ├── buffer.hpp
+│       │   ├── device.hpp
+│       │   └── execution_context.hpp
+│       ├── config/
+│       │   ├── training_config.hpp
+│       │   └── validator.hpp
+│       ├── data/
+│       │   ├── dataset.hpp
+│       │   ├── era_index.hpp
+│       │   ├── temporal_index.hpp
+│       │   ├── binned_matrix.hpp
+│       │   └── ordered_encoder.hpp
+│       ├── objectives/
+│       │   ├── objective.hpp
+│       │   ├── student_t.hpp
+│       │   ├── regression.hpp
+│       │   ├── classification.hpp
+│       │   └── ranking.hpp
+│       ├── robust/
+│       │   ├── era_dro.hpp
+│       │   └── downside.hpp
+│       ├── finance/
+│       │   ├── factor_penalty.hpp
+│       │   ├── turnover_penalty.hpp
+│       │   └── sparse_operator.hpp
+│       ├── tree/
+│       │   ├── histogram.hpp
+│       │   ├── split_evaluator.hpp
+│       │   ├── coverage_prior.hpp
+│       │   ├── tree.hpp
+│       │   └── tree_builder.hpp
+│       ├── training/
+│       │   ├── coordinator.hpp
+│       │   ├── derivative_composer.hpp
+│       │   ├── line_search.hpp
+│       │   └── checkpoint.hpp
+│       ├── backend/
+│       │   ├── backend.hpp
+│       │   ├── cpu_backend.hpp
+│       │   ├── cuda_backend.hpp
+│       │   └── hip_backend.hpp
+│       └── serialization/
+│           ├── model_format.hpp
+│           └── model_io.hpp
+├── src/
+│   ├── api/
+│   ├── core/
+│   ├── config/
+│   ├── data/
+│   ├── objectives/
+│   ├── robust/
+│   ├── finance/
+│   ├── tree/
+│   ├── training/
+│   ├── backend/cpu/
+│   └── serialization/
+├── gpu/
+│   ├── common/
+│   │   ├── gpu_primitives.cuh
+│   │   ├── gpu_math.cuh
+│   │   └── gpu_atomic.cuh
+│   ├── cuda/
+│   │   ├── objective_kernels.cu
+│   │   ├── dro_kernels.cu
+│   │   ├── histogram_kernels.cu
+│   │   ├── split_kernels.cu
+│   │   ├── factor_kernels.cu
+│   │   ├── turnover_kernels.cu
+│   │   ├── prediction_kernels.cu
+│   │   └── cuda_backend.cu
+│   └── hip/
+│       ├── objective_kernels.hip
+│       ├── histogram_kernels.hip
+│       └── hip_backend.hip
+├── bindings/
+│   └── python/
+├── tests/
+│   ├── mathematical/
+│   ├── cpu/
+│   ├── gpu/
+│   ├── parity/
+│   ├── leakage/
+│   └── benchmark/
+└── tools/
+    ├── model_inspector/
+    └── benchmark_runner/</code></pre>
+    </section>
+
+    <section>
+      <h2>5. 基本型</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/core/types.hpp
+#pragma once
+
+#include &lt;cstddef&gt;
+#include &lt;cstdint&gt;
+#include &lt;limits&gt;
+
+namespace fortgbm {
+
+using RowIndex = std::uint32_t;
+using FeatureIndex = std::uint32_t;
+using BinIndex = std::uint32_t;
+using EraIndex = std::uint32_t;
+using NodeIndex = std::int32_t;
+using TreeIndex = std::uint32_t;
+using Timestamp = std::int64_t;
+
+constexpr NodeIndex kInvalidNode = -1;
+
+enum class DeviceType : std::uint8_t {
+    kCpu,
+    kCuda,
+    kHip
+};
+
+enum class PrecisionMode : std::uint8_t {
+    kFloat32,
+    kMixed,
+    kFloat64
+};
+
+enum class DeterminismMode : std::uint8_t {
+    kFast,
+    kReproducible,
+    kStrict
+};
+
+enum class TaskType : std::uint8_t {
+    kRegression,
+    kBinaryClassification,
+    kMulticlassClassification,
+    kRanking,
+    kQuantile
+};
+
+}</code></pre>
+
+      <h3>5.1 Index幅</h3>
+      <p>
+        初期高速実装は32-bit row indexを標準とする。
+        \(N \geq 2^{32}\) の場合はpartitioned datasetまたは64-bit buildを使用する。
+        model node indexは推論効率のため32-bitを標準とする。
+      </p>
+    </section>
+
+    <section>
+      <h2>6. Statusと例外</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/core/status.hpp
+#pragma once
+
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+
+namespace fortgbm {
+
+enum class StatusCode {
+    kOk,
+    kInvalidArgument,
+    kTemporalLeakage,
+    kOutOfMemory,
+    kNumericalFailure,
+    kSolverFailure,
+    kDeviceFailure,
+    kSerializationFailure,
+    kUnsupported
+};
+
+class Status {
+public:
+    Status() = default;
+
+    Status(StatusCode code, std::string message)
+        : code_(code),
+          message_(std::move(message)) {}
+
+    [[nodiscard]] bool ok() const noexcept {
+        return code_ == StatusCode::kOk;
+    }
+
+    [[nodiscard]] StatusCode code() const noexcept {
+        return code_;
+    }
+
+    [[nodiscard]] const std::string&amp; message() const noexcept {
+        return message_;
+    }
+
+private:
+    StatusCode code_{StatusCode::kOk};
+    std::string message_;
+};
+
+class FortGbmError : public std::runtime_error {
+public:
+    FortGbmError(StatusCode code, const std::string&amp; message)
+        : std::runtime_error(message),
+          code_(code) {}
+
+    [[nodiscard]] StatusCode code() const noexcept {
+        return code_;
+    }
+
+private:
+    StatusCode code_;
+};
+
+}</code></pre>
+
+      <p>
+        内部kernel境界では例外を使用せず<code>Status</code>を返す。
+        公開C++ APIは設定により<code>StatusOr&lt;T&gt;</code>または例外を提供する。
+        C ABIでは必ずerror codeを返す。
+      </p>
+    </section>
+
+    <section>
+      <h2>7. Bufferと所有権</h2>
+
+      <h3>7.1 デバイス非依存Buffer</h3>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/core/buffer.hpp
+#pragma once
+
+#include &lt;cstddef&gt;
+#include &lt;memory&gt;
+#include &lt;span&gt;
+
+#include "fortgbm/core/types.hpp"
+
+namespace fortgbm {
+
+template&lt;typename T&gt;
+class Buffer {
+public:
+    Buffer() = default;
+
+    Buffer(
+        DeviceType device,
+        std::size_t size,
+        std::shared_ptr&lt;void&gt; allocation,
+        T* data
+    )
+        : device_(device),
+          size_(size),
+          allocation_(std::move(allocation)),
+          data_(data) {}
+
+    [[nodiscard]] DeviceType device() const noexcept {
+        return device_;
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept {
+        return size_;
+    }
+
+    [[nodiscard]] T* data() noexcept {
+        return data_;
+    }
+
+    [[nodiscard]] const T* data() const noexcept {
+        return data_;
+    }
+
+private:
+    DeviceType device_{DeviceType::kCpu};
+    std::size_t size_{0};
+    std::shared_ptr&lt;void&gt; allocation_;
+    T* data_{nullptr};
+};
+
+}</code></pre>
+
+      <h3>7.2 所有権規則</h3>
+      <ul>
+        <li><code>Buffer</code>はallocationの共有所有権を持つ。</li>
+        <li>kernel起動中のbuffer解放を防ぐため、event依存をmemory poolが管理する。</li>
+        <li>非所有viewは<code>std::span</code>または<code>DeviceSpan</code>を使う。</li>
+        <li>host pointerをdevice kernelへ暗黙に渡さない。</li>
+        <li>非同期転送元host memoryはpinned allocationまたは同期完了まで生存させる。</li>
+      </ul>
+
+      <h3>7.3 GPU memory pool</h3>
+      <pre><code class="language-cpp">class DeviceMemoryPool {
+public:
+    virtual ~DeviceMemoryPool() = default;
+
+    virtual Status Allocate(
+        std::size_t bytes,
+        std::size_t alignment,
+        void** output
+    ) = 0;
+
+    virtual Status ReleaseDeferred(
+        void* pointer,
+        std::size_t bytes,
+        DeviceEvent completion_event
+    ) = 0;
+
+    virtual Status Trim() = 0;
+
+    [[nodiscard]] virtual std::size_t BytesInUse() const = 0;
+    [[nodiscard]] virtual std::size_t PeakBytesInUse() const = 0;
+};</code></pre>
+    </section>
+
+    <section>
+      <h2>8. ExecutionContext</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/core/execution_context.hpp
+#pragma once
+
+#include &lt;cstdint&gt;
+#include &lt;memory&gt;
+
+#include "fortgbm/core/types.hpp"
+
+namespace fortgbm {
+
+class Backend;
+class DeviceMemoryPool;
+class ThreadPool;
+
+struct ExecutionContext {
+    DeviceType device_type{DeviceType::kCpu};
+    int device_id{0};
+    PrecisionMode precision{PrecisionMode::kMixed};
+    DeterminismMode determinism{DeterminismMode::kFast};
+
+    std::uint64_t random_seed{0};
+
+    std::shared_ptr&lt;Backend&gt; backend;
+    std::shared_ptr&lt;DeviceMemoryPool&gt; memory_pool;
+    std::shared_ptr&lt;ThreadPool&gt; thread_pool;
+
+    void* compute_stream{nullptr};
+    void* transfer_stream{nullptr};
+    void* reduction_stream{nullptr};
+};
+
+}</code></pre>
+
+      <h3>8.1 Stream構成</h3>
+      <ul>
+        <li><code>compute_stream</code>：objective、histogram、split、prediction</li>
+        <li><code>transfer_stream</code>：host-device非同期転送</li>
+        <li><code>reduction_stream</code>：DRO、era loss、global reduce</li>
+      </ul>
+
+      <p>
+        stream間依存はeventで表現し、通常経路ではdevice-wide synchronizationを禁止する。
+      </p>
+    </section>
+
+    <section>
+      <h2>9. Backendインターフェース</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/backend/backend.hpp
+#pragma once
+
+#include "fortgbm/core/status.hpp"
+
+namespace fortgbm {
+
+class Dataset;
+class DerivativeBuffer;
+class HistogramWorkspace;
+class Tree;
+class PredictionBuffer;
+struct ObjectiveState;
+struct EraDROResult;
+
+class Backend {
+public:
+    virtual ~Backend() = default;
+
+    virtual Status ComputeObjectiveDerivatives(
+        const Dataset&amp; dataset,
+        const PredictionBuffer&amp; prediction,
+        const ObjectiveState&amp; objective_state,
+        DerivativeBuffer* output
+    ) = 0;
+
+    virtual Status AggregateEraLoss(
+        const Dataset&amp; dataset,
+        const PredictionBuffer&amp; prediction,
+        const ObjectiveState&amp; objective_state,
+        Buffer&lt;double&gt;* era_loss
+    ) = 0;
+
+    virtual Status BuildHistograms(
+        const Dataset&amp; dataset,
+        const DerivativeBuffer&amp; derivatives,
+        const Buffer&lt;RowIndex&gt;&amp; rows,
+        HistogramWorkspace* output
+    ) = 0;
+
+    virtual Status PredictTree(
+        const Dataset&amp; dataset,
+        const Tree&amp; tree,
+        PredictionBuffer* output
+    ) = 0;
+
+    virtual Status Synchronize() = 0;
+};
+
+}</code></pre>
+
+      <h3>9.1 拡張インターフェース</h3>
+      <p>
+        factor、turnover、DRO、split評価は性能上backend固有処理が必要なため、
+        <code>Backend</code>のサブインターフェースとして分離する。
+      </p>
+
+      <pre><code class="language-cpp">class FinancialBackend {
+public:
+    virtual ~FinancialBackend() = default;
+
+    virtual Status ComputeFactorPenalty(
+        const FactorOperator&amp; factor_operator,
+        const PredictionBuffer&amp; prediction,
+        PenaltyResult* output
+    ) = 0;
+
+    virtual Status ComputeTurnoverPenalty(
+        const TurnoverOperator&amp; turnover_operator,
+        const PredictionBuffer&amp; prediction,
+        PenaltyResult* output
+    ) = 0;
+};
+
+class RobustBackend {
+public:
+    virtual ~RobustBackend() = default;
+
+    virtual Status SolveEraDRO(
+        const Buffer&lt;double&gt;&amp; loss,
+        const Buffer&lt;double&gt;&amp; reference_weight,
+        const EraDROConfig&amp; config,
+        EraDROResult* output
+    ) = 0;
+
+    virtual Status EvaluateRobustSplits(
+        const SplitBatch&amp; split_batch,
+        const SplitEvaluationContext&amp; context,
+        SplitResultBatch* output
+    ) = 0;
+};</code></pre>
+    </section>
+
+    <section>
+      <h2>10. Dataset C++設計</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/data/dataset.hpp
+#pragma once
+
+#include "fortgbm/core/buffer.hpp"
+#include "fortgbm/core/types.hpp"
+
+namespace fortgbm {
+
+struct Dataset {
+    std::size_t row_count{0};
+    std::size_t feature_count{0};
+    std::size_t era_count{0};
+
+    Buffer&lt;BinIndex&gt; binned_features;
+    Buffer&lt;double&gt; target;
+    Buffer&lt;double&gt; sample_weight;
+    Buffer&lt;double&gt; normalized_era_weight;
+
+    Buffer&lt;EraIndex&gt; era_by_row;
+    Buffer&lt;RowIndex&gt; era_offsets;
+    Buffer&lt;Timestamp&gt; observation_time;
+    Buffer&lt;Timestamp&gt; target_maturity_time;
+
+    Buffer&lt;std::uint64_t&gt; instrument_id;
+    Buffer&lt;std::uint64_t&gt; query_id;
+
+    BinnedFeatureLayout feature_layout;
+    EraMetadata era_metadata;
+    FeatureSchema feature_schema;
+};
+
+}</code></pre>
+
+      <h3>10.1 GPU向け特徴量layout</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Layout</th>
+            <th>用途</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>feature-major</td>
+            <td>全rowに対するfeature別histogram構築</td>
+          </tr>
+          <tr>
+            <td>row-major packed</td>
+            <td>tree predictionとrow partition</td>
+          </tr>
+          <tr>
+            <td>ELLPACK-like compressed</td>
+            <td>GPUのcoalesced access</td>
+          </tr>
+          <tr>
+            <td>CSR sparse</td>
+            <td>高疎性データ</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        初期CUDA実装はELLPACK-like feature matrixを標準とする。
+        bin数が256以下なら1 byte、65536以下なら2 byteで格納する。
+      </p>
+    </section>
+
+    <section>
+      <h2>11. TrainingConfig</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/config/training_config.hpp
+#pragma once
+
+#include &lt;cstddef&gt;
+#include &lt;cstdint&gt;
+#include &lt;string&gt;
+
+namespace fortgbm {
+
+struct DeviceConfig {
+    std::string backend{"auto"};
+    int device_id{0};
+    std::size_t memory_limit_bytes{0};
+    bool allow_cpu_fallback{true};
+    bool use_pinned_host_memory{true};
+    int stream_count{3};
+    std::string precision{"mixed"};
+    std::string determinism{"fast"};
+};
+
+struct TreeConfig {
+    std::size_t max_iterations{1000};
+    std::size_t max_leaves{31};
+    std::size_t max_depth{6};
+    std::size_t max_bins{255};
+
+    std::size_t min_samples_per_leaf{100};
+    double min_curvature_per_leaf{1.0};
+    double min_eras_per_leaf{8.0};
+
+    double l1_regularization{0.0};
+    double l2_regularization{1.0};
+    double minimum_split_score{0.0};
+};
+
+struct StudentTConfig {
+    double degrees_of_freedom{5.0};
+    bool estimate_degrees_of_freedom{false};
+    double minimum_degrees_of_freedom{2.01};
+    double maximum_degrees_of_freedom{100.0};
+
+    std::string scale_mode{"era_hierarchical"};
+    double scale_floor{1.0e-6};
+    std::size_t auxiliary_update_interval{1};
+};
+
+struct EraDROConfig {
+    double radius{0.05};
+    double weight_cap_multiplier{3.0};
+    double sum_tolerance{1.0e-10};
+    double kl_tolerance{1.0e-10};
+    std::size_t maximum_iterations{100};
+};
+
+struct GpuConfig {
+    std::string histogram_mode{"auto"};
+    std::string era_histogram_mode{"exact"};
+    std::size_t feature_batch_size{0};
+    std::size_t split_batch_size{4096};
+    bool use_cuda_graphs{true};
+    bool enable_peer_access{true};
+    bool use_nccl{true};
+};
+
+struct TrainingConfig {
+    DeviceConfig device;
+    TreeConfig tree;
+    StudentTConfig student_t;
+    EraDROConfig era_dro;
+    EraDROConfig split_dro;
+    GpuConfig gpu;
+
+    double learning_rate{0.03};
+    double factor_penalty{0.0};
+    double turnover_penalty{0.0};
+    double downside_penalty{0.0};
+
+    bool exact_line_search{true};
+    std::uint64_t random_seed{0};
+};
+
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>12. Objective C++インターフェース</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/objectives/objective.hpp
+#pragma once
+
+#include &lt;memory&gt;
+#include &lt;string_view&gt;
+
+namespace fortgbm {
+
+struct DerivativeBuffer {
+    Buffer&lt;double&gt; gradient;
+    Buffer&lt;double&gt; curvature;
+};
+
+struct ObjectiveEvaluation {
+    Buffer&lt;double&gt; sample_loss;
+    Buffer&lt;double&gt; era_loss;
+    double total_reference_loss{0.0};
+};
+
+class Objective {
+public:
+    virtual ~Objective() = default;
+
+    [[nodiscard]] virtual std::string_view Name() const noexcept = 0;
+
+    virtual Status Validate(
+        const Dataset&amp; dataset
+    ) const = 0;
+
+    virtual Status InitializePrediction(
+        const Dataset&amp; dataset,
+        PredictionBuffer* prediction
+    ) const = 0;
+
+    virtual Status ComputeDerivatives(
+        const ExecutionContext&amp; context,
+        const Dataset&amp; dataset,
+        const PredictionBuffer&amp; prediction,
+        DerivativeBuffer* output
+    ) const = 0;
+
+    virtual Status Evaluate(
+        const ExecutionContext&amp; context,
+        const Dataset&amp; dataset,
+        const PredictionBuffer&amp; prediction,
+        ObjectiveEvaluation* output
+    ) const = 0;
+
+    virtual Status UpdateAuxiliaryState(
+        const ExecutionContext&amp; context,
+        const Dataset&amp; dataset,
+        const PredictionBuffer&amp; prediction,
+        ObjectiveState* state
+    ) const = 0;
+};
+
+}</code></pre>
+
+      <h3>12.1 Runtime polymorphism</h3>
+      <p>
+        Objective選択は学習開始時の一回だけなのでvirtual dispatchを許容する。
+        サンプル単位の計算はvirtual関数内部からtemplate化されたCPU loopまたはGPU kernelへ渡し、
+        行ごとのvirtual dispatchは行わない。
+      </p>
+    </section>
+
+    <section>
+      <h2>13. Student-t CPU kernel</h2>
+
+      <pre><code class="language-cpp">// File: src/objectives/student_t_cpu.cpp
+#include &lt;algorithm&gt;
+#include &lt;cmath&gt;
+
+namespace fortgbm {
+
+void ComputeStudentTDerivativesCpu(
+    const double* target,
+    const double* prediction,
+    const EraIndex* era,
+    const double* scale_by_era,
+    std::size_t row_count,
+    double degrees_of_freedom,
+    double curvature_floor,
+    double curvature_ceiling,
+    double* gradient,
+    double* curvature
+) {
+    const double nu = degrees_of_freedom;
+
+    #pragma omp parallel for schedule(static)
+    for (std::int64_t index = 0;
+         index &lt; static_cast&lt;std::int64_t&gt;(row_count);
+         ++index) {
+        const std::size_t i = static_cast&lt;std::size_t&gt;(index);
+        const double residual = target[i] - prediction[i];
+        const double sigma = scale_by_era[era[i]];
+        const double denominator =
+            nu * sigma * sigma + residual * residual;
+
+        gradient[i] =
+            -((nu + 1.0) * residual) / denominator;
+
+        const double mm_curvature =
+            (nu + 1.0) / denominator;
+
+        curvature[i] = std::clamp(
+            mm_curvature,
+            curvature_floor,
+            curvature_ceiling
+        );
+    }
+}
+
+}</code></pre>
+
+      <h3>13.1 SIMD</h3>
+      <p>
+        era別scaleのgatherが必要なため、AVX2/AVX-512 gather命令または
+        era連続row layoutを利用する。eraごとに連続配置されている場合、
+        scaleをregisterへ保持して内側loopをvectorizeする。
+      </p>
+    </section>
+
+    <section>
+      <h2>14. Student-t CUDA kernel</h2>
+
+      <pre><code class="language-cpp">// File: gpu/cuda/objective_kernels.cu
+#include &lt;cuda_runtime.h&gt;
+
+namespace fortgbm::cuda {
+
+__global__ void StudentTDerivativeKernel(
+    const double* target,
+    const double* prediction,
+    const EraIndex* era_by_row,
+    const double* scale_by_era,
+    std::size_t row_count,
+    double degrees_of_freedom,
+    double curvature_floor,
+    double curvature_ceiling,
+    double* gradient,
+    double* curvature
+) {
+    const std::size_t index =
+        static_cast&lt;std::size_t&gt;(blockIdx.x) * blockDim.x
+        + threadIdx.x;
+
+    if (index &gt;= row_count) {
+        return;
+    }
+
+    const double residual =
+        target[index] - prediction[index];
+
+    const double sigma =
+        scale_by_era[era_by_row[index]];
+
+    const double denominator =
+        fma(
+            degrees_of_freedom,
+            sigma * sigma,
+            residual * residual
+        );
+
+    gradient[index] =
+        -((degrees_of_freedom + 1.0) * residual)
+        / denominator;
+
+    const double raw_curvature =
+        (degrees_of_freedom + 1.0)
+        / denominator;
+
+    curvature[index] =
+        fmin(
+            curvature_ceiling,
+            fmax(curvature_floor, raw_curvature)
+        );
+}
+
+}</code></pre>
+
+      <h3>14.1 Precision mode</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Mode</th>
+            <th>予測・勾配</th>
+            <th>累積</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>float32</code></td>
+            <td>float</td>
+            <td>floatまたはdouble選択</td>
+          </tr>
+          <tr>
+            <td><code>mixed</code></td>
+            <td>float</td>
+            <td>era loss、histogram、objectiveはdouble</td>
+          </tr>
+          <tr>
+            <td><code>float64</code></td>
+            <td>double</td>
+            <td>double</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        金融標準はmixed precisionとする。
+        split境界付近のscore比較とDROはdoubleで実行する。
+      </p>
+    </section>
+
+    <section>
+      <h2>15. Era Loss Aggregation</h2>
+
+      <h3>15.1 数式</h3>
+      <div class="equation">
+        \[
+        L_e
+        =
+        \sum_{i:e_i=e}a_i\ell_i.
+        \]
+      </div>
+
+      <h3>15.2 CPU実装</h3>
+      <p>
+        eraごとにrowが連続しているため、era単位のparallel loopで競合を避ける。
+      </p>
+
+      <h3>15.3 GPU実装</h3>
+      <p>
+        各eraを一つ以上のthread blockへ割り当てるsegmented reductionを使用する。
+        大規模eraは複数blockのpartial sumを生成し、二段階reduceする。
+      </p>
+
+      <pre><code class="language-text">Kernel A:
+    one or more blocks per era
+    compute weighted sample loss
+    write partial era sums
+
+Kernel B:
+    reduce partial sums for each era
+    write final era loss</code></pre>
+
+      <h3>15.4 Deterministic reduction</h3>
+      <ul>
+        <li>strict modeでは固定tree reductionを使用する。</li>
+        <li>atomicAddによる順序不定reduceは使用しない。</li>
+        <li>fast modeではdouble atomicまたはcooperative reductionを許可する。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>16. Capped KL-DRO C++設計</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/robust/era_dro.hpp
+#pragma once
+
+namespace fortgbm {
+
+struct EraDROResult {
+    double robust_risk{0.0};
+    double kl_divergence{0.0};
+    double temperature{0.0};
+    double normalization_dual{0.0};
+
+    Buffer&lt;double&gt; adversarial_weight;
+    Buffer&lt;std::uint8_t&gt; active_cap;
+
+    double sum_residual{0.0};
+    double kl_residual{0.0};
+    std::size_t outer_iterations{0};
+    std::size_t inner_iterations{0};
+};
+
+class EraDROSolver {
+public:
+    virtual ~EraDROSolver() = default;
+
+    virtual Status Solve(
+        const ExecutionContext&amp; context,
+        const Buffer&lt;double&gt;&amp; loss,
+        const Buffer&lt;double&gt;&amp; reference_weight,
+        const Buffer&lt;double&gt;&amp; cap,
+        const EraDROConfig&amp; config,
+        EraDROResult* result
+    ) = 0;
+};
+
+}</code></pre>
+
+      <h3>16.1 解法</h3>
+      <ol>
+        <li>loss降順のcap付き線形最大化解を計算する。</li>
+        <li>そのKLが半径内ならKL制約inactiveとして返す。</li>
+        <li>それ以外は温度 \(\tau\) を外側二分探索する。</li>
+        <li>各 \(\tau\) で正規化dual \(\eta\) を内側二分探索する。</li>
+        <li>総和、KL、capのKKT残差を確認する。</li>
+      </ol>
+
+      <h3>16.2 GPU実行方針</h3>
+      <p>
+        era数が小さい場合、GPU kernel起動コストが支配的になる。
+        次の規則でbackendを選択する。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>条件</th>
+            <th>実行場所</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>era数が閾値未満</td>
+            <td>CPUでsolver、era lossだけ非同期転送</td>
+          </tr>
+          <tr>
+            <td>era数が閾値以上</td>
+            <td>GPUで全solver</td>
+          </tr>
+          <tr>
+            <td>複数GPU</td>
+            <td>global era lossをall-reduce後、rank 0または全GPUで解く</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>16.3 GPU kernel分割</h3>
+      <pre><code class="language-text">LinearMaxKernel
+    compute cap-constrained extreme distribution
+
+NormalizationKernel
+    evaluate q_e(tau, eta)
+    output partial sum
+
+KlKernel
+    evaluate q_e * log(q_e / pi_e)
+    output partial KL
+
+RiskKernel
+    evaluate q_e * loss_e
+
+Host or device controller
+    update eta and tau bounds</code></pre>
+
+      <p>
+        CUDA Graphを使う場合、固定回数のbisectionをgraph化する。
+        厳密な早期終了はmaskで無効化し、graph topologyを固定する。
+      </p>
+    </section>
+
+    <section>
+      <h2>17. Financial Penalty C++設計</h2>
+
+      <h3>17.1 共通結果</h3>
+
+      <pre><code class="language-cpp">struct PenaltyResult {
+    double value{0.0};
+    Buffer&lt;double&gt; gradient;
+    Buffer&lt;double&gt; diagonal_majorizer;
+};</code></pre>
+
+      <h3>17.2 FactorOperator</h3>
+
+      <pre><code class="language-cpp">struct FactorEraBlock {
+    RowIndex row_begin{0};
+    RowIndex row_end{0};
+    std::size_t factor_count{0};
+
+    Buffer&lt;double&gt; centered_factor_matrix;
+    Buffer&lt;double&gt; cholesky_factor;
+    Buffer&lt;double&gt; normalized_weight;
+
+    double scale_normalization{1.0};
+};
+
+class FactorOperator {
+public:
+    std::vector&lt;FactorEraBlock&gt; era_blocks;
+    double ridge{1.0e-6};
+};</code></pre>
+
+      <h3>17.3 GPU factor計算</h3>
+      <ol>
+        <li>era内weighted meanをreduceする。</li>
+        <li>予測を中心化する。</li>
+        <li>\(\widetilde Z_e^\top W_eF_e\) をbatched GEMVで計算する。</li>
+        <li>ridge付きGram行列をbatched Choleskyで解く。</li>
+        <li>\(\widetilde Z_e\beta_e\) をbatched GEMVで計算する。</li>
+        <li>penaltyとgradientを生成する。</li>
+      </ol>
+
+      <p>
+        cuBLASとcuSOLVERのbatched APIを利用する。
+        factor数が小さい場合は専用shared-memory kernelを使用する。
+      </p>
+
+      <h3>17.4 TurnoverOperator</h3>
+
+      <pre><code class="language-cpp">struct TurnoverEdge {
+    RowIndex current_row;
+    RowIndex previous_row;
+    double current_coefficient;
+    double previous_coefficient;
+    double cost;
+};
+
+class TurnoverOperator {
+public:
+    Buffer&lt;TurnoverEdge&gt; edges;
+    double smoothing_delta{1.0e-4};
+};</code></pre>
+
+      <h3>17.5 GPU turnover kernel</h3>
+
+      <p>edge \(k\) ごとに、</p>
+
+      <div class="equation">
+        \[
+        d_k=b_kF_{i_k}-a_kF_{j_k},
+        \]
+        \[
+        u_k=c_k\frac{d_k}{\sqrt{d_k^2+\delta^2}},
+        \]
+        \[
+        w_k=c_k\frac{\delta^2}{(d_k^2+\delta^2)^{3/2}}
+        \]
+      </div>
+
+      <p>
+        を計算する。gradient scatterにはatomic addが必要になる。
+        strict deterministic modeではinstrumentごとにedgeをsortし、
+        segmented reduction後に一回だけrow gradientへ書き込む。
+      </p>
+    </section>
+
+    <section>
+      <h2>18. DerivativeComposer</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/training/derivative_composer.hpp
+#pragma once
+
+namespace fortgbm {
+
+class DerivativeComposer {
+public:
+    Status Compose(
+        const ExecutionContext&amp; context,
+        const Dataset&amp; dataset,
+        const DerivativeBuffer&amp; task_derivatives,
+        const Buffer&lt;double&gt;&amp; adversarial_era_weight,
+        const PenaltyResult* downside,
+        const PenaltyResult* factor,
+        const PenaltyResult* turnover,
+        DerivativeBuffer* output
+    ) const;
+};
+
+}</code></pre>
+
+      <div class="equation">
+        \[
+        G_i
+        =
+        q_{e_i}^\star a_i g_i^{\mathrm{task}}
+        +
+        \lambda_dg_i^{\mathrm{down}}
+        +
+        \lambda_fg_i^{\mathrm{factor}}
+        +
+        \lambda_tg_i^{\mathrm{turn}},
+        \]
+        \[
+        H_i
+        =
+        q_{e_i}^\star a_ih_i^{\mathrm{task}}
+        +
+        \lambda_d\widetilde h_i^{\mathrm{down}}
+        +
+        \lambda_f\widetilde h_i^{\mathrm{factor}}
+        +
+        \lambda_t\widetilde h_i^{\mathrm{turn}}
+        +
+        h_{\min}.
+        \]
+      </div>
+
+      <h3>18.1 GPU fusion</h3>
+      <p>
+        memory bandwidth削減のため、era weight適用、各penalty gradient加算、
+        curvature clipを一つのfused kernelで行う。
+      </p>
+    </section>
+
+    <section>
+      <h2>19. Histogramデータ構造</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/tree/histogram.hpp
+#pragma once
+
+namespace fortgbm {
+
+struct AggregateHistogramEntry {
+    double gradient_sum;
+    double curvature_sum;
+    double sample_weight_sum;
+    std::uint32_t sample_count;
+};
+
+struct EraHistogramEntry {
+    double gradient_sum;
+    double curvature_sum;
+};
+
+struct HistogramDescriptor {
+    FeatureIndex feature;
+    std::size_t bin_count;
+    std::size_t era_count;
+    std::size_t aggregate_offset;
+    std::size_t era_offset;
+};
+
+struct HistogramWorkspace {
+    Buffer&lt;AggregateHistogramEntry&gt; aggregate_entries;
+    Buffer&lt;EraHistogramEntry&gt; era_entries;
+    Buffer&lt;HistogramDescriptor&gt; descriptors;
+};
+
+}</code></pre>
+
+      <h3>19.1 Memory量</h3>
+      <div class="equation">
+        \[
+        M_{\mathrm{era\ hist}}
+        \approx
+        PBE
+        \times
+        2
+        \times
+        \operatorname{sizeof}(\mathrm{accumulator}).
+        \]
+      </div>
+
+      <p>
+        \(PBE\) が大きい場合、全feature・全eraを同時保持しない。
+        feature batchとera tileに分割する。
+      </p>
+    </section>
+
+    <section>
+      <h2>20. CPU Histogram</h2>
+
+      <h3>20.1 Thread-local方式</h3>
+      <pre><code class="language-text">for each feature batch:
+    allocate thread-local histogram
+
+    parallel for row block:
+        for each row in node:
+            read gradient and curvature
+            for each feature in batch:
+                read bin
+                update local aggregate histogram
+                update local era histogram
+
+    reduce local histograms in deterministic order
+    evaluate split candidates</code></pre>
+
+      <h3>20.2 競合回避</h3>
+      <ul>
+        <li>thread-local bufferを使用する。</li>
+        <li>巨大era histogramではera tileごとに処理する。</li>
+        <li>NUMA nodeごとにlocal reduceし、最後にglobal reduceする。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>21. GPU Histogram</h2>
+
+      <h3>21.1 Kernel方式</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>方式</th>
+            <th>用途</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>shared-memory histogram</td>
+            <td>bin数とera tileがshared memoryへ収まる場合</td>
+          </tr>
+          <tr>
+            <td>global atomic histogram</td>
+            <td>高cardinality、fast mode</td>
+          </tr>
+          <tr>
+            <td>sort-reduce histogram</td>
+            <td>strict deterministic mode</td>
+          </tr>
+          <tr>
+            <td>hybrid tiled histogram</td>
+            <td>標準GPU方式</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>21.2 Tiled layout</h3>
+      <pre><code class="language-text">grid dimension:
+    x = feature tile
+    y = row tile
+    z = era tile or node batch
+
+within block:
+    load row gradient and curvature
+    load packed bins
+    update shared aggregate histogram
+    update shared era-tile histogram
+    flush shared entries to global partial histogram
+
+second kernel:
+    reduce partial histograms</code></pre>
+
+      <h3>21.3 Era tile</h3>
+      <p>
+        一度に扱うera数を \(E_t\) とし、shared memory量を、
+      </p>
+
+      <div class="equation">
+        \[
+        M_{\mathrm{shared}}
+        =
+        B_t
+        \left[
+          S_{\mathrm{aggregate}}
+          +
+          E_tS_{\mathrm{era}}
+        \right]
+      </div>
+
+      <p>
+        とする。device shared memory上限から \(B_t,E_t\) をautotuneする。
+      </p>
+
+      <h3>21.4 Atomic precision</h3>
+      <ul>
+        <li>mixed modeでもglobal histogramはdoubleを標準とする。</li>
+        <li>double atomic未対応deviceはCAS実装またはpartial reduceを使用する。</li>
+        <li>strict modeではglobal atomic順序依存を避ける。</li>
+      </ul>
+
+      <h3>21.5 Histogram subtraction</h3>
+      <p>
+        親histogramから小さい子histogramを引き、大きい子を生成する。
+        GPUではvectorized subtraction kernelを使用する。
+      </p>
+
+      <div class="equation">
+        \[
+        \operatorname{Hist}(R)
+        =
+        \operatorname{Hist}(P)
+        -
+        \operatorname{Hist}(L).
+      \]
+      </div>
+
+      <p>
+        負の微小曲率は許容誤差内なら0へclipする。
+        超過時は大きい子histogramを再構築する。
+      </p>
+    </section>
+
+    <section>
+      <h2>22. Prefix ScanとSplit候補生成</h2>
+
+      <p>
+        数値featureのthreshold候補はbin histogramのprefix sumから作る。
+      </p>
+
+      <div class="equation">
+        \[
+        G_{L,b}
+        =
+        \sum_{k\leq b}G_k,
+        \qquad
+        H_{L,b}
+        =
+        \sum_{k\leq b}H_k.
+      \]
+      </div>
+
+      <p>
+        era別統計にも同じprefix scanを適用する。
+      </p>
+
+      <h3>22.1 GPU scan</h3>
+      <ul>
+        <li>bin数がwarp内ならwarp shuffle scanを使う。</li>
+        <li>bin数がblock内ならBlelloch scanを使う。</li>
+        <li>era次元はera tileごとにscanする。</li>
+        <li>欠損binはprefixから分離し、missing-leftとmissing-rightを評価する。</li>
+      </ul>
+
+      <h3>22.2 Candidate batch</h3>
+
+      <pre><code class="language-cpp">struct SplitCandidateStatistics {
+    FeatureIndex feature;
+    BinIndex threshold;
+    std::uint8_t missing_direction;
+
+    double parent_gradient;
+    double parent_curvature;
+    double left_gradient;
+    double left_curvature;
+    double right_gradient;
+    double right_curvature;
+
+    std::size_t era_vector_offset;
+};</code></pre>
+    </section>
+
+    <section>
+      <h2>23. Coverage Prior実装</h2>
+
+      <h3>23.1 Effective era coverage</h3>
+      <div class="equation">
+        \[
+        u_{A,e}
+        =
+        \frac{H_{A,e}}{H_A},
+        \qquad
+        N_{\mathrm{eff},A}
+        =
+        \frac{1}{\sum_eu_{A,e}^2}.
+      \]
+      </div>
+
+      <h3>23.2 Prior precision</h3>
+      <div class="equation">
+        \[
+        \lambda_{A,\mathrm{cov}}
+        =
+        H_{\mathrm{ref}}
+        \left[
+          \frac{\kappa_E}{N_{\mathrm{eff},A}+\varepsilon}
+          +
+          \kappa_\chi\chi_A^2
+          +
+          \kappa_dd_A^{\mathrm{stale}}
+        \right].
+      \end{div>
+
+      <h3>23.3 GPU kernel</h3>
+      <p>
+        candidateごとにera vectorをreduceし、
+        \(N_{\mathrm{eff}}\)、\(\chi^2\)、stalenessを計算する。
+        era数がwarp以下なら一candidateを一warpへ割り当てる。
+        大きい場合は一candidateを一blockへ割り当てる。
+      </p>
+
+      <h3>23.4 葉値</h3>
+      <div class="equation">
+        \[
+        v_A
+        =
+        -
+        \frac{
+          \operatorname{SoftThreshold}(G_A,\lambda_1)
+        }{
+          H_A+\lambda_2+\lambda_{A,\mathrm{cov}}
+        }.
+      </div>
+    </section>
+
+    <section>
+      <h2>24. GPU Robust Split評価</h2>
+
+      <h3>24.1 Era改善vector</h3>
+      <div class="equation">
+        \[
+        \begin{aligned}
+        \Delta_e={}&
+        G_{P,e}v_P+\frac12H_{P,e}v_P^2
+        \\
+        &-
+        G_{L,e}v_L-\frac12H_{L,e}v_L^2
+        \\
+        &-
+        G_{R,e}v_R-\frac12H_{R,e}v_R^2.
+        \end{aligned}
+      \end{div>
+
+      <h3>24.2 二段階評価</h3>
+      <p>
+        全candidateへ完全DRO solverを実行すると高コストになるため、
+        数学的に安全なscreeningと完全評価を分離する。
+      </p>
+
+      <ol>
+        <li>曲率、sample数、coverageによる不適格候補を除外する。</li>
+        <li>安価な下界またはsoft-min近似で候補を絞る。</li>
+        <li>上位 \(K\) 候補に対してcapped KL-DROを完全に解く。</li>
+        <li>最終候補を元era粒度とdouble precisionで再評価する。</li>
+      </ol>
+
+      <div class="warning">
+        screeningで真の最良候補を除外しないため、
+        使用するscreening値は上限・下限関係が証明できるもの、
+        または明示的な近似モードに限定する。
+        標準の<code>research_exact</code>では全有効候補を完全評価する。
+      </div>
+
+      <h3>24.3 Candidate parallelism</h3>
+      <ul>
+        <li>era数が小さい場合：一candidateを一warp。</li>
+        <li>era数が中程度：一candidateを一block。</li>
+        <li>era数が大きい場合：candidate-era二次元grid。</li>
+      </ul>
+
+      <h3>24.4 Weighted MAD</h3>
+      <p>
+        weighted medianとMADはsortを必要とする。
+        GPU高速モードでは次の選択肢を提供する。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Mode</th>
+            <th>方式</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>exact</code></td>
+            <td>candidateごとのweighted sort/select</td>
+          </tr>
+          <tr>
+            <td><code>histogram</code></td>
+            <td>改善量をquantized histogramへ入れて近似median</td>
+          </tr>
+          <tr>
+            <td><code>disabled</code></td>
+            <td>MAD penaltyを無効化しDROとnegative-eraだけを使用</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>25. Row Partition</h2>
+
+      <p>
+        split採用後、nodeのrow indexを左右へ安定partitionする。
+      </p>
+
+      <h3>25.1 CPU</h3>
+      <p>
+        thread-local left/right bufferへ書き込み、prefix offsetから結合する。
+      </p>
+
+      <h3>25.2 GPU</h3>
+      <ol>
+        <li>各rowのleft/right flagを計算する。</li>
+        <li>exclusive scanで出力offsetを計算する。</li>
+        <li>stable scatterで左右row bufferへ書く。</li>
+      </ol>
+
+      <p>
+        CUB DeviceScanまたはbackend共通scan primitiveを利用する。
+      </p>
+    </section>
+
+    <section>
+      <h2>26. TreeBuilder C++設計</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/tree/tree_builder.hpp
+#pragma once
+
+namespace fortgbm {
+
+class TreeBuilder {
+public:
+    TreeBuilder(
+        ExecutionContext context,
+        TreeConfig config,
+        SplitEvaluationConfig split_config
+    );
+
+    Status Build(
+        const Dataset&amp; dataset,
+        const DerivativeBuffer&amp; derivatives,
+        Tree* output_tree,
+        TreeBuildDiagnostics* diagnostics
+    );
+
+private:
+    Status BuildNodeHistogram(NodeIndex node);
+    Status FindBestSplit(NodeIndex node, SplitCandidate* output);
+    Status ApplySplit(const SplitCandidate&amp; candidate);
+    Status FinalizeLeaves();
+
+    ExecutionContext context_;
+    TreeConfig config_;
+    SplitEvaluationConfig split_config_;
+
+    RowPartition row_partition_;
+    HistogramCache histogram_cache_;
+    std::vector&lt;TreeNode&gt; nodes_;
+};
+
+}</code></pre>
+
+      <h3>26.1 Priority queue</h3>
+      <p>
+        GPUで全tree controlを行うよりCPUで木構造を制御する方が柔軟であるため、
+        初期実装では次のhybrid方式とする。
+      </p>
+
+      <pre><code class="language-text">CPU:
+    manage leaf-wise priority queue
+    decide next node to split
+    update tree topology
+
+GPU:
+    build histogram
+    scan bins
+    evaluate split candidates
+    partition rows
+    produce diagnostics</code></pre>
+
+      <p>
+        GPUからCPUへ返す値は最良candidateと少量の診断値だけに限定する。
+      </p>
+    </section>
+
+    <section>
+      <h2>27. Exact Objective GPU評価</h2>
+
+      <h3>27.1 候補予測</h3>
+      <div class="equation">
+        \[
+        F_i(\alpha)
+        =
+        F_i+\alpha f_i.
+      \]
+      </div>
+
+      <p>
+        base predictionとcandidate tree predictionをdevice上に保持し、
+        line searchごとに全予測vectorを恒久更新しない。
+      </p>
+
+      <h3>27.2 Fused candidate evaluation</h3>
+      <pre><code class="language-text">Input:
+    base prediction F
+    tree prediction f
+    candidate step alpha
+
+Fused kernel:
+    candidate = F + alpha * f
+    compute sample task loss
+    compute factor intermediate values
+    compute turnover edge differences
+
+Reduction:
+    aggregate era loss
+    aggregate factor penalty
+    aggregate turnover penalty
+
+DRO:
+    solve inner maximization
+
+Host:
+    combine all objective terms
+    test Armijo condition</code></pre>
+
+      <h3>27.3 Multi-alpha batch</h3>
+      <p>
+        backtracking候補 \(\alpha_0,\alpha_1,\ldots\) を一括評価するオプションを提供する。
+        ただし各alphaでDROを再最適化する必要がある。
+      </p>
+
+      <p>
+        GPUメモリに余裕がある場合はalpha-batchを使用し、
+        最初にArmijo条件を満たす最大alphaを選ぶ。
+      </p>
+    </section>
+
+    <section>
+      <h2>28. LineSearch C++設計</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/training/line_search.hpp
+#pragma once
+
+namespace fortgbm {
+
+struct LineSearchResult {
+    bool accepted{false};
+    double step{0.0};
+    double objective_before{0.0};
+    double objective_after{0.0};
+    double directional_derivative{0.0};
+    std::size_t evaluation_count{0};
+};
+
+class ExactLineSearch {
+public:
+    Status Search(
+        const ExecutionContext&amp; context,
+        const Dataset&amp; dataset,
+        const PredictionBuffer&amp; current_prediction,
+        const PredictionBuffer&amp; tree_prediction,
+        const FullObjectiveContext&amp; objective_context,
+        LineSearchResult* result
+    ) const;
+};
+
+}</code></pre>
+
+      <h3>28.1 受理条件</h3>
+      <div class="equation">
+        \[
+        J(F+\alpha f)
+        \leq
+        J(F)
+        +
+        c_1\alpha\nabla J(F)^\top f
+        +
+        \varepsilon_{\mathrm{solver}}.
+      \]
+      </div>
+
+      <p>
+        \(\varepsilon_{\mathrm{solver}}\)はDRO solverと浮動小数点reduceの誤差上限を反映する。
+        高速モードでも固定された絶対誤差だけでなくobjective scaleに比例する相対誤差を併用する。
+      </p>
+    </section>
+
+    <section>
+      <h2>29. Ordered Encoder C++設計</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/data/ordered_encoder.hpp
+#pragma once
+
+namespace fortgbm {
+
+struct MaturityEvent {
+    Timestamp maturity_time;
+    RowIndex row;
+    std::uint64_t event_id;
+};
+
+class OrderedEncoder {
+public:
+    Status FitTransform(
+        const HostDatasetView&amp; source,
+        OrderedEncodingOutput* output
+    );
+
+    Status TransformPointInTime(
+        const HostDatasetView&amp; source,
+        const OrderedEncodingState&amp; initial_state,
+        OrderedEncodingOutput* output
+    );
+
+    Status UpdateMaturedTarget(
+        const MaturityEvent&amp; event,
+        double target,
+        double sample_weight
+    );
+
+private:
+    Status AdvanceStateUntil(Timestamp observation_time);
+
+    OrderedEncodingState state_;
+    MaturityQueue maturity_queue_;
+};
+
+}</code></pre>
+
+      <h3>29.1 CPU/GPU責務</h3>
+      <p>
+        複雑なhash state、時刻順event、可変長カテゴリ履歴を扱うため、
+        初期実装のordered encoderはCPUで実行する。
+        生成されたordered numeric featureをGPUへ転送してbinningする。
+      </p>
+
+      <h3>29.2 GPU拡張</h3>
+      <p>
+        大規模batch向けに、時刻とcategory keyをsortした後、
+        segmented prefix aggregateでstrict-past統計を生成する。
+      </p>
+
+      <pre><code class="language-text">1. create records:
+       category key
+       observation time
+       maturity time
+       target
+       weight
+
+2. sort records by category key and maturity time
+
+3. construct maturity-prefix sufficient statistics
+
+4. for each observation:
+       binary-search the last eligible maturity event
+       read prefix statistics
+
+5. compute smoothed ordered encoding</code></pre>
+
+      <div class="warning">
+        Student-t robust category locationは単純なprefix sufficient statisticだけでは厳密計算できない。
+        GPU版では固定回数IRLS、有限履歴window、またはonline robust approximationを明示的に選択する。
+      </div>
+    </section>
+
+    <section>
+      <h2>30. GPU Binning</h2>
+
+      <h3>30.1 Quantile sketch</h3>
+      <p>
+        初期versionではbin境界生成をCPUで行う。
+        GPU拡張ではsample sort、radix sort、weighted quantile selectionを使用する。
+      </p>
+
+      <h3>30.2 Bin適用</h3>
+      <p>
+        各値に対して境界配列をbinary searchする。
+        bin数が小さい場合はconstant memoryまたはshared memoryへ境界を置く。
+      </p>
+
+      <h3>30.3 圧縮</h3>
+      <ul>
+        <li>256 bins以下：<code>std::uint8_t</code></li>
+        <li>65536 bins以下：<code>std::uint16_t</code></li>
+        <li>それ以上：<code>std::uint32_t</code></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>31. GPU Prediction</h2>
+
+      <h3>31.1 Node-based kernel</h3>
+      <p>
+        一threadが一rowを担当し、各treeをrootからleafまで辿る。
+      </p>
+
+      <h3>31.2 Tree grouping</h3>
+      <ul>
+        <li>小さいtree群をconstant memoryへ置く。</li>
+        <li>node arrayをstructure-of-arraysで保存する。</li>
+        <li>treeをbatch化してglobal memory accessを減らす。</li>
+        <li>深さが浅いtreeはbranchless traversalへ変換可能にする。</li>
+      </ul>
+
+      <pre><code class="language-cpp">struct DeviceTree {
+    const FeatureIndex* split_feature;
+    const BinIndex* threshold;
+    const NodeIndex* left_child;
+    const NodeIndex* right_child;
+    const std::uint8_t* missing_direction;
+    const double* leaf_value;
+
+    NodeIndex root;
+    double step;
+};</code></pre>
+
+      <h3>31.3 Warp divergence</h3>
+      <p>
+        同一warp内で異なる経路を辿るためdivergenceが発生する。
+        feature binをcoalescedに読むrow-major packed layoutと、
+        浅い木制約により影響を抑える。
+      </p>
+    </section>
+
+    <section>
+      <h2>32. 複数GPU設計</h2>
+
+      <h3>32.1 Partition方式</h3>
+
+      <table>
+        <thead>
+          <tr>
+            <th>方式</th>
+            <th>説明</th>
+            <th>標準用途</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>row partition</td>
+            <td>各GPUが一部rowを保持</td>
+            <td>大規模データ、標準</td>
+          </tr>
+          <tr>
+            <td>feature partition</td>
+            <td>各GPUが一部featureを保持</td>
+            <td>feature数が非常に多い場合</td>
+          </tr>
+          <tr>
+            <td>hybrid</td>
+            <td>node groupとfeature groupを分割</td>
+            <td>将来拡張</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>32.2 Era整合性</h3>
+      <p>
+        row partitionで同一eraが複数GPUへ分割される場合、
+        era lossとera histogramをall-reduceする必要がある。
+      </p>
+
+      <p>通信量を抑えるため次の配置を優先する。</p>
+      <ol>
+        <li>可能ならera単位でGPUへ割り当てる。</li>
+        <li>巨大eraだけを複数GPUへ分割する。</li>
+        <li>global era lossは毎反復all-reduceする。</li>
+        <li>split用era histogramはfeature batch単位でreduceする。</li>
+      </ol>
+
+      <h3>32.3 分散学習手順</h3>
+      <pre><code class="language-text">each GPU:
+    compute local sample loss
+    aggregate local era loss
+
+all-reduce:
+    global era loss
+
+solve:
+    global capped KL-DRO
+
+broadcast:
+    adversarial era weights
+
+each GPU:
+    compute local gradients and curvature
+    build local histograms
+
+all-reduce:
+    aggregate histograms for current feature batch
+
+each GPU or coordinator:
+    evaluate identical split candidates
+
+coordinator:
+    choose global best split
+    broadcast split
+
+each GPU:
+    partition local rows
+    continue tree construction</code></pre>
+
+      <h3>32.4 Collective通信</h3>
+      <ul>
+        <li>NVIDIA：NCCL</li>
+        <li>AMD：RCCL</li>
+        <li>異種環境：MPIまたはUCX</li>
+        <li>単一nodeではP2P accessとNVLinkを優先</li>
+      </ul>
+
+      <h3>32.5 分散決定論</h3>
+      <p>
+        strict modeではcollective reduction treeとrank順序を固定する。
+        異なるGPU数の間でbit一致は保証せず、同一GPU数・同一topologyを再現条件とする。
+      </p>
+    </section>
+
+    <section>
+      <h2>33. GPUメモリ計画</h2>
+
+      <h3>33.1 常駐データ</h3>
+      <ul>
+        <li>binned feature matrix</li>
+        <li>target、weight、era、instrument</li>
+        <li>prediction、gradient、curvature</li>
+        <li>tree ensemble</li>
+        <li>factor・turnover operator</li>
+      </ul>
+
+      <h3>33.2 一時データ</h3>
+      <ul>
+        <li>node row index</li>
+        <li>histogram workspace</li>
+        <li>split candidate era vector</li>
+        <li>DRO partial reduce</li>
+        <li>line search candidate loss</li>
+      </ul>
+
+      <h3>33.3 Budget planner</h3>
+
+      <pre><code class="language-cpp">struct GpuMemoryPlan {
+    std::size_t resident_dataset_bytes{0};
+    std::size_t derivative_bytes{0};
+    std::size_t histogram_bytes{0};
+    std::size_t split_workspace_bytes{0};
+    std::size_t financial_operator_bytes{0};
+    std::size_t line_search_bytes{0};
+    std::size_t safety_margin_bytes{0};
+
+    std::size_t feature_batch_size{0};
+    std::size_t era_tile_size{0};
+    std::size_t node_batch_size{0};
+};</code></pre>
+
+      <h3>33.4 OOM時の縮退順序</h3>
+      <ol>
+        <li>temporary cacheを解放する。</li>
+        <li>feature batchを縮小する。</li>
+        <li>era tileを縮小する。</li>
+        <li>node batchを縮小する。</li>
+        <li>line search alpha batchを逐次化する。</li>
+        <li>histogramをhostへspillする。</li>
+        <li>設定許可時はCPUへfallbackする。</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>34. Out-of-Core GPU</h2>
+
+      <p>
+        binned datasetがGPU memoryへ収まらない場合、row pageまたはfeature pageでstreamingする。
+      </p>
+
+      <pre><code class="language-text">Host pinned page A:
+    transfer to GPU on transfer stream
+
+GPU page A:
+    build partial histogram on compute stream
+
+Host pinned page B:
+    prepare next page concurrently
+
+GPU:
+    accumulate partial histogram
+    repeat until all pages are processed</code></pre>
+
+      <h3>34.1 Double buffering</h3>
+      <p>
+        二つ以上のpinned bufferを使用し、転送と計算をoverlapする。
+        PCIe帯域が律速の場合はbin圧縮とfeature batchingを優先する。
+      </p>
+
+      <h3>34.2 Exactness</h3>
+      <p>
+        pageごとのpartial histogramを最終的に全pageでreduceするため、
+        浮動小数点順序差を除きin-coreと同じ統計を得る。
+      </p>
+    </section>
+
+    <section>
+      <h2>35. CUDA Graph</h2>
+
+      <p>反復構造が固定的な次の処理をgraph化する。</p>
+
+      <ul>
+        <li>objective derivative</li>
+        <li>era loss aggregation</li>
+        <li>derivative composition</li>
+        <li>tree prediction</li>
+        <li>line search候補評価</li>
+      </ul>
+
+      <p>
+        木構造探索はnode数と候補数が動的なため、全体graph化ではなく
+        feature batch単位のsubgraphを使用する。
+      </p>
+    </section>
+
+    <section>
+      <h2>36. CPU/GPU Fallback</h2>
+
+      <h3>36.1 Fallback可能処理</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>処理</th>
+            <th>Fallback</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>DRO solver</td>
+            <td>GPU era lossをCPUへ転送して実行可能</td>
+          </tr>
+          <tr>
+            <td>weighted MAD</td>
+            <td>上位candidateだけCPUで評価可能</td>
+          </tr>
+          <tr>
+            <td>ordered encoding</td>
+            <td>標準でCPU</td>
+          </tr>
+          <tr>
+            <td>factor solve</td>
+            <td>小規模またはill-conditioned eraをCPUへ移行可能</td>
+          </tr>
+          <tr>
+            <td>histogram</td>
+            <td>GPU OOM時にCPUへ移行可能</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>36.2 Fallback禁止条件</h3>
+      <ul>
+        <li><code>allow_cpu_fallback=false</code></li>
+        <li>strict latency契約がある推論</li>
+        <li>fallbackに必要なhost memoryを確保できない場合</li>
+        <li>デバイス障害後にbuffer整合性を検証できない場合</li>
+      </ul>
+
+      <h3>36.3 Device failure</h3>
+      <p>
+        CUDA error発生後は非同期errorを同期点で回収し、
+        最後の確定checkpointへrollbackする。
+        contextが破損した場合は再利用せず再生成する。
+      </p>
+    </section>
+
+    <section>
+      <h2>37. 決定論設計</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Mode</th>
+            <th>内容</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>fast</code></td>
+            <td>atomic、非固定reduce、autotuneを許可</td>
+          </tr>
+          <tr>
+            <td><code>reproducible</code></td>
+            <td>seed、tie-break、主要reduce順を固定</td>
+          </tr>
+          <tr>
+            <td><code>strict</code></td>
+            <td>sort-reduce、固定kernel構成、autotune結果固定</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>37.1 Strict mode条件</h3>
+      <ul>
+        <li>同じGPU modelとdriver major version</li>
+        <li>同じGPU数とdevice topology</li>
+        <li>同じthread block構成</li>
+        <li>同じ特殊関数implementation</li>
+        <li>同じcompiler flags</li>
+      </ul>
+
+      <h3>37.2 Split tie-break</h3>
+      <ol>
+        <li>高いrobust score</li>
+        <li>高いrobust lower gain</li>
+        <li>高いeffective era coverage</li>
+        <li>小さいfeature index</li>
+        <li>小さいthreshold bin</li>
+        <li>固定missing direction順</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>38. 数値精度契約</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>計算</th>
+            <th>最低精度</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Student-t sample derivative</td>
+            <td>mixedまたはdouble</td>
+          </tr>
+          <tr>
+            <td>era loss</td>
+            <td>double accumulation</td>
+          </tr>
+          <tr>
+            <td>DRO</td>
+            <td>double</td>
+          </tr>
+          <tr>
+            <td>histogram</td>
+            <td>double accumulation推奨</td>
+          </tr>
+          <tr>
+            <td>robust split score</td>
+            <td>double</td>
+          </tr>
+          <tr>
+            <td>factor Gram solve</td>
+            <td>double</td>
+          </tr>
+          <tr>
+            <td>turnover gradient</td>
+            <td>mixedまたはdouble</td>
+          </tr>
+          <tr>
+            <td>完全objective</td>
+            <td>double</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>38.1 Tensor Core</h3>
+      <p>
+        factor GEMMにTensor Coreを利用できるが、TF32を標準では無効とする。
+        設定で有効化した場合も、最終penaltyとline searchはdoubleで再評価する。
+      </p>
+    </section>
+
+    <section>
+      <h2>39. TrainingCoordinator C++設計</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/training/coordinator.hpp
+#pragma once
+
+namespace fortgbm {
+
+class TrainingCoordinator {
+public:
+    TrainingCoordinator(
+        TrainingConfig config,
+        std::shared_ptr&lt;Backend&gt; backend,
+        std::unique_ptr&lt;Objective&gt; objective
+    );
+
+    Status Fit(
+        Dataset* training_data,
+        const std::vector&lt;Dataset*&gt;&amp; validation_data,
+        EnsembleModel* output_model
+    );
+
+private:
+    Status Initialize();
+    Status UpdateAuxiliaryState();
+    Status UpdateEraDRO();
+    Status ComputeDerivatives();
+    Status BuildCandidateTree();
+    Status EvaluateAndAcceptTree();
+    Status EvaluateValidation();
+    Status RestoreBestCheckpoint();
+
+    TrainingConfig config_;
+    ExecutionContext context_;
+
+    std::shared_ptr&lt;Backend&gt; backend_;
+    std::unique_ptr&lt;Objective&gt; objective_;
+    std::unique_ptr&lt;EraDROSolver&gt; dro_solver_;
+
+    PredictionBuffer prediction_;
+    DerivativeBuffer derivatives_;
+    EraDROResult dro_result_;
+
+    EnsembleModel ensemble_;
+    TrainingCheckpoint checkpoint_;
+};
+
+}</code></pre>
+
+      <h3>39.1 反復シーケンス</h3>
+
+      <pre><code class="language-text">CPU Coordinator
+    |
+    |-- launch auxiliary update if scheduled
+    |-- launch sample objective kernel
+    |-- launch era reduction
+    |-- solve or dispatch era-DRO
+    |-- launch financial penalty kernels
+    |-- launch derivative composer
+    |
+    |-- request candidate tree
+    |      |
+    |      +-- GPU histogram
+    |      +-- GPU split evaluation
+    |      +-- CPU topology control
+    |
+    |-- launch tree prediction
+    |-- run exact line search
+    |-- accept or rollback
+    |-- run validation
+    |-- record diagnostics</code></pre>
+    </section>
+
+    <section>
+      <h2>40. Model C++設計</h2>
+
+      <pre><code class="language-cpp">// File: include/fortgbm/tree/tree.hpp
+#pragma once
+
+namespace fortgbm {
+
+struct TreeNode {
+    FeatureIndex split_feature{0};
+    BinIndex threshold{0};
+
+    NodeIndex left_child{kInvalidNode};
+    NodeIndex right_child{kInvalidNode};
+
+    std::uint8_t missing_direction{0};
+    std::uint8_t is_leaf{1};
+
+    double leaf_value{0.0};
+    double coverage_prior_precision{0.0};
+};
+
+struct Tree {
+    std::vector&lt;TreeNode&gt; nodes;
+    double step_size{1.0};
+};
+
+struct EnsembleModel {
+    double base_score{0.0};
+    std::vector&lt;Tree&gt; trees;
+
+    ObjectiveState objective_state;
+    FeatureBinningState binning_state;
+    OrderedEncodingState ordered_state;
+    FinancialOperatorMetadata financial_metadata;
+    TrainingManifest manifest;
+};
+
+}</code></pre>
+
+      <p>
+        modelはdevice pointerを保存しない。
+        GPU推論開始時に<code>DeviceModelCache</code>へ転送する。
+      </p>
+    </section>
+
+    <section>
+      <h2>41. Python Binding</h2>
+
+      <h3>41.1 pybind11層</h3>
+      <ul>
+        <li>NumPy arrayのshape、dtype、contiguityを検証する。</li>
+        <li>CPU入力は可能ならzero-copy viewを使う。</li>
+        <li>CUDA array interfaceまたはDLPackを利用可能にする。</li>
+        <li>長時間処理ではPython GILを解放する。</li>
+        <li>C++例外をPython例外へ変換する。</li>
+      </ul>
+
+      <h3>41.2 GPU input</h3>
+      <p>
+        CuPy、PyTorch、JAX等のdevice arrayはDLPack経由で受け入れる。
+        lifetime tokenを保持し、非同期kernel完了前の解放を防ぐ。
+      </p>
+
+      <h3>41.3 API例</h3>
+      <pre><code class="language-python">model = FORTRegressor(
+    objective="student_t",
+    device="cuda",
+    device_id=0,
+    precision="mixed",
+    deterministic="reproducible",
+    era_dro_radius=0.05,
+    era_weight_cap=3.0,
+    factor_penalty=0.1,
+    turnover_penalty=0.05,
+)
+
+model.fit(
+    X,
+    y,
+    era=era,
+    observation_time=observation_time,
+    target_maturity_time=target_maturity_time,
+    categorical_feature=categories,
+    instrument_id=instrument_id,
+    factor_matrix=factors,
+)</code></pre>
+    </section>
+
+    <section>
+      <h2>42. C ABI</h2>
+
+      <pre><code class="language-c">// File: include/fortgbm/api/c_api.h
+#pragma once
+
+#include &lt;stddef.h&gt;
+#include &lt;stdint.h&gt;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef void* FortDatasetHandle;
+typedef void* FortModelHandle;
+typedef void* FortTrainingHandle;
+
+typedef enum FortStatusCode {
+    FORT_STATUS_OK = 0,
+    FORT_STATUS_INVALID_ARGUMENT = 1,
+    FORT_STATUS_NUMERICAL_FAILURE = 2,
+    FORT_STATUS_DEVICE_FAILURE = 3,
+    FORT_STATUS_OUT_OF_MEMORY = 4
+} FortStatusCode;
+
+FortStatusCode FortTrain(
+    FortDatasetHandle dataset,
+    const char* configuration_json,
+    FortModelHandle* output_model
+);
+
+FortStatusCode FortPredict(
+    FortModelHandle model,
+    FortDatasetHandle dataset,
+    double* output_prediction,
+    size_t output_length
+);
+
+const char* FortGetLastError(void);
+
+void FortFreeModel(FortModelHandle model);
+
+#ifdef __cplusplus
+}
+#endif</code></pre>
+
+      <p>
+        C ABIはJSONまたはversioned structで設定を受け取り、
+        C++標準ライブラリ型を境界へ露出しない。
+      </p>
+    </section>
+
+    <section>
+      <h2>43. Build設計</h2>
+
+      <pre><code class="language-cmake"># File: CMakeLists.txt
+cmake_minimum_required(VERSION 3.24)
+
+project(
+    fortgbm
+    VERSION 2.0.0
+    LANGUAGES CXX
+)
+
+option(FORTGBM_ENABLE_CUDA "Enable CUDA backend" ON)
+option(FORTGBM_ENABLE_HIP "Enable HIP backend" OFF)
+option(FORTGBM_ENABLE_OPENMP "Enable OpenMP" ON)
+option(FORTGBM_BUILD_PYTHON "Build Python bindings" ON)
+option(FORTGBM_BUILD_TESTS "Build tests" ON)
+option(FORTGBM_STRICT_WARNINGS "Enable strict warnings" ON)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_subdirectory(src)
+
+if(FORTGBM_ENABLE_CUDA)
+    enable_language(CUDA)
+    add_subdirectory(gpu/cuda)
+endif()
+
+if(FORTGBM_ENABLE_HIP)
+    add_subdirectory(gpu/hip)
+endif()
+
+if(FORTGBM_BUILD_PYTHON)
+    add_subdirectory(bindings/python)
+endif()
+
+if(FORTGBM_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()</code></pre>
+
+      <h3>43.1 CUDA compiler設定</h3>
+      <ul>
+        <li>relocatable device codeは必要なtargetだけに限定する。</li>
+        <li>fast mathは標準で無効にする。</li>
+        <li>line information付きperformance buildを提供する。</li>
+        <li>対応architectureごとのfat binaryまたはPTXを選択可能にする。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>44. Serialization</h2>
+
+      <h3>44.1 GPU非依存</h3>
+      <p>
+        保存形式はhost endianを正規化し、device architecture、CUDA pointer、
+        stream、kernel configurationを保存しない。
+      </p>
+
+      <h3>44.2 保存項目</h3>
+      <ul>
+        <li>tree構造とstep size</li>
+        <li>bin境界とカテゴリ辞書</li>
+        <li>Student-t自由度とscale</li>
+        <li>ordered state</li>
+        <li>factor・turnover metadata</li>
+        <li>学習設定と自動縮退記録</li>
+        <li>backend、device、precision、determinism情報</li>
+      </ul>
+
+      <h3>44.3 Device cache</h3>
+      <p>
+        model読込後、最初のGPU予測または学習再開時にdevice cacheを生成する。
+        cacheはmodel hashとdevice IDをkeyとして再利用可能にする。
+      </p>
+    </section>
+
+    <section>
+      <h2>45. CPU単体テスト</h2>
+
+      <ul>
+        <li>Student-t勾配と有限差分の一致</li>
+        <li>MM上界と接触条件</li>
+        <li>DRO primal・KKT条件</li>
+        <li>coverage prior葉値の最適性</li>
+        <li>factor・turnover勾配の有限差分検証</li>
+        <li>robust splitの参照Python実装との一致</li>
+        <li>line search受理後の完全objective非増加</li>
+        <li>ordered encoderの未来target不変性</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>46. GPUテスト</h2>
+
+      <h3>46.1 CPU/GPU parity</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>対象</th>
+            <th>比較</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>sample loss</td>
+            <td>絶対・相対誤差</td>
+          </tr>
+          <tr>
+            <td>gradient・curvature</td>
+            <td>element-wise誤差</td>
+          </tr>
+          <tr>
+            <td>era loss</td>
+            <td>eraごとの誤差</td>
+          </tr>
+          <tr>
+            <td>DRO weight</td>
+            <td>最大絶対誤差とKKT残差</td>
+          </tr>
+          <tr>
+            <td>histogram</td>
+            <td>bin・era別統計</td>
+          </tr>
+          <tr>
+            <td>split score</td>
+            <td>候補ごとの誤差とbest split一致</td>
+          </tr>
+          <tr>
+            <td>tree prediction</td>
+            <td>rowごとの予測一致</td>
+          </tr>
+          <tr>
+            <td>full objective</td>
+            <td>各構成項と合計</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>46.2 GPU race test</h3>
+      <ul>
+        <li>CUDA Compute Sanitizerによるracecheck</li>
+        <li>initcheckによる未初期化memory検出</li>
+        <li>memcheckによる範囲外access検出</li>
+        <li>異なるblock sizeでの一致検証</li>
+      </ul>
+
+      <h3>46.3 Device matrix</h3>
+      <ul>
+        <li>複数compute capability</li>
+        <li>double atomic対応・非対応相当経路</li>
+        <li>単一GPU・複数GPU</li>
+        <li>小memory GPUによるOOM縮退</li>
+        <li>PCIe・NVLink環境</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>47. Property-Based Test</h2>
+
+      <ul>
+        <li>DRO半径0で \(q=\pi\) になる。</li>
+        <li>DRO radius増加に対してrobust riskが非減少になる。</li>
+        <li>era capを厳しくすると最大敵対重みが非増加になる。</li>
+        <li>coverage prior増加に対して葉値絶対値が非増加になる。</li>
+        <li>turnover penaltyが0ならturnover勾配が合成されない。</li>
+        <li>factor直交予測ではfactor penaltyが数値誤差内で0になる。</li>
+        <li>受理された固定objective木で完全目的関数が非増加になる。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>48. GPU性能試験</h2>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Benchmark</th>
+            <th>測定値</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Objective kernel</td>
+            <td>rows/sec、GB/sec、occupancy</td>
+          </tr>
+          <tr>
+            <td>Era reduction</td>
+            <td>rows/sec、eras/sec</td>
+          </tr>
+          <tr>
+            <td>DRO solver</td>
+            <td>solve latency、iterations</td>
+          </tr>
+          <tr>
+            <td>Histogram</td>
+            <td>feature-bin-era updates/sec</td>
+          </tr>
+          <tr>
+            <td>Split evaluation</td>
+            <td>candidates/sec</td>
+          </tr>
+          <tr>
+            <td>Factor penalty</td>
+            <td>era-factor rows/sec</td>
+          </tr>
+          <tr>
+            <td>Turnover penalty</td>
+            <td>edges/sec</td>
+          </tr>
+          <tr>
+            <td>Prediction</td>
+            <td>rows/sec、P50/P95 latency</td>
+          </tr>
+          <tr>
+            <td>Multi-GPU</td>
+            <td>strong scaling、communication ratio</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>48.1 Profiler</h3>
+      <ul>
+        <li>Nsight Systems</li>
+        <li>Nsight Compute</li>
+        <li>rocprof</li>
+        <li>Linux perf</li>
+        <li>VTune</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>49. GPU拡張ロードマップ</h2>
+
+      <h3>Phase G1：単一GPU基盤</h3>
+      <ul>
+        <li>device memory pool</li>
+        <li>objective derivative</li>
+        <li>era loss reduction</li>
+        <li>tree prediction</li>
+        <li>CPU/GPU parity test</li>
+      </ul>
+
+      <h3>Phase G2：GPU Tree Training</h3>
+      <ul>
+        <li>ELLPACK-like bin matrix</li>
+        <li>aggregate histogram</li>
+        <li>era tiled histogram</li>
+        <li>prefix scan</li>
+        <li>row partition</li>
+      </ul>
+
+      <h3>Phase G3：Robust Split</h3>
+      <ul>
+        <li>coverage prior kernel</li>
+        <li>era改善vector</li>
+        <li>GPU capped KL-DRO</li>
+        <li>weighted MAD exact・approximate mode</li>
+      </ul>
+
+      <h3>Phase G4：Financial Penalties</h3>
+      <ul>
+        <li>batched factor projection</li>
+        <li>turnover sparse edge kernel</li>
+        <li>fused derivative composer</li>
+      </ul>
+
+      <h3>Phase G5：完全GPU学習</h3>
+      <ul>
+        <li>device-resident prediction</li>
+        <li>exact objective line search</li>
+        <li>CUDA Graph</li>
+        <li>asynchronous validation</li>
+      </ul>
+
+      <h3>Phase G6：複数GPU</h3>
+      <ul>
+        <li>era-aware row partition</li>
+        <li>NCCL histogram all-reduce</li>
+        <li>distributed DRO</li>
+        <li>multi-GPU deterministic mode</li>
+      </ul>
+
+      <h3>Phase G7：Portable GPU</h3>
+      <ul>
+        <li>HIP backend</li>
+        <li>RCCL</li>
+        <li>backend共通primitive整理</li>
+        <li>CUDA/HIP parity test</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>50. C++・GPU受入基準</h2>
+
+      <ol>
+        <li>C++20のCPUコアで全主要objectiveが実行できること。</li>
+        <li>Student-t MM、DRO、factor、turnoverの数学テストを通過すること。</li>
+        <li>CUDA backendでobjective、histogram、split、predictionが実行できること。</li>
+        <li>GPU era lossとDRO weightがCPU参照値に許容誤差内で一致すること。</li>
+        <li>GPU robust splitがCPUと同じbest splitを選択すること。</li>
+        <li>同値score時のtie-breakがCPU/GPUで一致すること。</li>
+        <li>全受理木について完全objectiveの非増加条件を満たすこと。</li>
+        <li>GPU OOM時に設定どおり縮退または安全に失敗すること。</li>
+        <li>単一GPUモデルをCPUとGPUの双方で推論できること。</li>
+        <li>保存形式がGPU architectureに依存しないこと。</li>
+        <li>reproducible modeで同一環境の再学習結果が一致すること。</li>
+        <li>複数GPUでera lossとhistogramのcollective結果が単一GPU参照値と一致すること。</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>51. 最終構成</h2>
+
+      <div class="equation">
+        \[
+        \boxed{
+        \begin{aligned}
+        \mathrm{FORT\mbox{-}GBM\ v2}
+        ={}&
+        \mathrm{C{++}20\ Core}
+        +
+        \mathrm{CPU\ SIMD/Parallel\ Backend}
+        \\
+        &+
+        \mathrm{CUDA/HIP\ Execution\ Backend}
+        +
+        \mathrm{Device\ Resident\ Training}
+        \\
+        &+
+        \mathrm{Student\mbox{-}t\ MM}
+        +
+        \mathrm{Capped\ Era\ KL\mbox{-}DRO}
+        \\
+        &+
+        \mathrm{Era\mbox{-}Tiled\ Histogram}
+        +
+        \mathrm{GPU\ Robust\ Split}
+        \\
+        &+
+        \mathrm{Factor/Turnover\ Sparse\ Kernels}
+        +
+        \mathrm{Exact\ GPU\ Line\ Search}
+        \\
+        &+
+        \mathrm{Multi\mbox{-}GPU\ Collective\ Training}
+        +
+        \mathrm{Point\mbox{-}in\mbox{-}Time\ Safety}.
+        \end{aligned}
+        }
+      \]
+      </div>
+
+      <div class="definition">
+        C++実装では数学層、木学習層、execution backendを分離する。
+        GPUは単なる標準GBDT histogram高速化ではなく、era別統計、
+        capped KL-DRO、coverage prior、factor penalty、turnover penalty、
+        完全目的関数line searchまで含めてdevice上へ拡張する。
+        動的な木構造制御は初期段階ではCPUに置き、
+        大規模なサンプル演算、histogram、split候補評価、予測およびreduceをGPUへ委譲する。
+        これにより数学的仕様を維持しながら、単一GPU、複数GPU、
+        out-of-coreおよびCPU fallbackへ段階的に対応する。
+      </div>
+    </section>
+  </article>
+</body>
+</html>
